@@ -1,0 +1,8 @@
+# Isolated forecast environment only. Do not install these into piia-env.
+# CPU torch must be installed first from the official CPU index:
+#   python3 -m venv ../forecast-env
+#   ../forecast-env/bin/pip install --index-url https://download.pytorch.org/whl/cpu 'torch>=2.2,<3'
+#   ../forecast-env/bin/pip install -r requirements-forecast.txt
+# Weights cache defaults to ../hf-cache. Official amazon/chronos-t5-tiny
+# revision 29d808298f1a62493e7b9a5e08529d0d930fa189, Apache-2.0.
+chronos-forecasting==2.3.2

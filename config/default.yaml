@@ -1,0 +1,63 @@
+# trading-lab 默认配置。阈值是设计例子，不是针对任何账户的建议。
+# 模拟资金 100000 USD 只是示例，不代表用户真实持仓或资金。
+
+timezone: Asia/Shanghai
+example_capital_usd: 100000.0
+
+instruments:
+  BTC-USD:
+    kind: crypto_spot
+    proxy_for: "Bitcoin 现货（BTC-USD）"
+    calendar: crypto_utc
+    yahoo_ticker: BTC-USD
+    fee: 0.001          # 0.10%，示例
+    slippage: 0.001     # 0.10%，示例
+  GLD:
+    kind: equity_etf
+    proxy_for: "黄金现货的可交易代理（GLD ETF，不是 XAU 现货，也不是 GC 期货或黄金 TD）"
+    calendar: XNYS
+    yahoo_ticker: GLD
+    fee: 0.0005         # 0.05%，示例
+    slippage: 0.0005
+  QQQ:
+    kind: equity_etf
+    proxy_for: "纳斯达克100的可交易代理（QQQ ETF，不是指数本身，不带杠杆）"
+    calendar: XNYS
+    yahoo_ticker: QQQ
+    fee: 0.0005
+    slippage: 0.0005
+
+strategy:
+  name: sma_trend_long_cash
+  sma_window: 200
+  # 收盘价高于 SMA 则下一交易时段开盘买入/保持多头，否则下一开盘卖到现金。
+  rule: "long if completed_close > sma_window else cash"
+  execution: next_session_open
+
+risk:
+  # 以下均为示例上限，不是投资建议。
+  max_weight: 0.40
+  cash_floor: 0.20
+  max_drawdown_halt: 0.20   # 从净值高点回撤达到该比例后，停止新开仓；已有多头仍可按信号卖出
+  long_only: true
+  allow_short: false
+  allow_leverage: false
+  max_gross_exposure: 1.0
+
+split:
+  history_start: "2018-01-01"
+  train_end: "2023-12-31"    # 含当天
+  test_start: "2024-01-01"
+  # 测试结束日随已完成的真实数据自动延伸，不写死。
+
+stale:
+  # 以「已完成的 K 线」判断，不是墙上时钟一刀切。
+  btc_max_age_hours: 36
+  # ETF：若最近一次已完成的纽约证券交易所时段之后，已经过了超过该数量的交易日，视为过期。
+  etf_max_completed_sessions_lag: 1
+
+data:
+  primary: yfinance
+  auto_adjust: true          # ETF 使用复权后的 OHLC，尽量与拆分/分红一致
+  cache_dir: data/cache
+  csv_dir: data/csv

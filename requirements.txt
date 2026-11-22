@@ -1,0 +1,8 @@
+# 研究原型依赖。精确版本见 requirements.lock。
+vectorbt==1.2.1
+streamlit
+pandas
+pyyaml
+pytest
+yfinance
+pandas-market-calendars

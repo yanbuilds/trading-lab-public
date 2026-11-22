@@ -1,0 +1,59 @@
+# Frozen uncalibrated research heuristics for liquidity & positioning states.
+# Changing any threshold or joint condition requires a new version and must not
+# be fitted on already-seen samples. These values are NOT calibrated and are
+# NOT a trading signal. They do not change FROZEN_POLICY_V1 mechanical rules.
+version: liquidity_positioning_v1
+calibrated: false
+historical_states_validated: false
+not_a_trading_signal: true
+does_not_change_frozen_policy: true
+venue_scope: bitget_usdt_linear_perpetuals_only
+marketwide_coverage: false
+dollar_series_id: DTWEXBGS
+dollar_series_is_not: ICE_DXY
+gold_instrument: XAUUSDT
+gold_instrument_is_not: XAUUSD
+risk_assets: [BTCUSDT, NDX100USDT]
+# Replay may only use records with a known available_at_utc <= cutoff.
+# If published_at or available_at is unknown, leave it null. Never copy
+# retrieved_at_utc into publication or availability fields.
+timestamp_policy:
+  never_copy_retrieved_to_published_or_available: true
+  replay_requires_known_available_at: true
+thresholds:
+  # All uncalibrated. Units are documented next to each key.
+  risk_asset_strong_return_24h_min: 0.0          # close-to-close fraction
+  oi_base_crowding_change_24h_pct_min: 5.0       # percent, base units only
+  real_yield_rise_5_obs_bps_min: 5.0             # DFII10, 100 bps = 1.00 percent
+  broad_dollar_rise_5_obs_pct_min: 0.2           # DTWEXBGS supporting only
+  etf_flow_weakening_days: 3                     # complete days only; dashes are not zero
+  price_fall_24h_pct_max: -2.0                   # return <= this percent
+  liquidation_rise_ratio_min: 1.5                # later 24h base amount / earlier 24h
+  funding_support_interval_rate_abs_min: 0.0003  # per settlement interval, not APY
+  funding_support_consecutive_settlements: 3
+  gold_sensitivity_window: 20
+  gold_sensitivity_min_pairs: 10
+  realized_demand_up_volume_ratio_min: 1.2       # up-bar volume / down-bar volume
+  realized_demand_lookback_hours: 24
+  prior_deleveraging_max_age_hours: 72
+  polymarket_thin_spread_max: 0.06
+  polymarket_min_visible_size: 50.0
+preregistered_validation:
+  status: not_run
+  hypothesis: >
+    When real yields have been rising, Bitget BTC base-unit open interest is
+    elevated, complete US spot BTC ETF flows are weakening, and (if available)
+    visible depth is deteriorating together, the risk of a large drawdown in the
+    following 7 UTC days is higher than under a leverage-only baseline.
+  metrics:
+    - false_positive_rate_on_labeled_non_events
+    - missed_risk_rate_on_labeled_events
+    - alert_lead_time_hours
+  not_metrics:
+    - backtest_alpha
+    - tuned_pnl
+  historical_data_insufficient: true
+  reason: >
+    Official public Bitget liquidations cover only about three days, many
+    macro/ETF publication times are unverified, and no point-in-time
+    liquidation or multi-venue archive has been collected yet.

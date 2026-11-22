@@ -1,0 +1,25 @@
+# Owner-editable local paper risk. Research agents and LLMs cannot change this file
+# through any tool route. Changes require an explicit manual edit or API with
+# actor=manual. This is not a live-venue risk policy.
+label: local_simplified_paper_100u
+engine: local_simplified
+exchange_live_verified: false
+liquidation_model: approximate_stress_not_venue_verified
+virtual_equity_usdt: 100
+max_leverage: 2
+max_open_positions: 1
+margin_mode: isolated
+cash_floor: 0.20
+max_margin_fraction: 0.50
+risk_fraction: 0.01
+slippage: 0.0005
+max_single_weight: 0.50
+max_related_weight: 0.80
+stale_price_hours: 36
+related_groups:
+  - [btcusdt-bitget-perp, btc-usd-spot]
+allowed_symbols: [BTCUSDT, XAUUSDT, NDX100USDT]
+disclaimer: >
+  Local simplified paper only. Exact Bitget margin, mark-price liquidation,
+  and ADL are unverified. Stress losses are approximate and not a guarantee.
+  Live and exchange-demo orders are disabled.

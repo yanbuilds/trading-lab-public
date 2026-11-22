@@ -1,0 +1,80 @@
+name: Research tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  intelligence:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PIIA_SKIP_NETWORK: "1"
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-piia.lock
+      - name: Install isolated intelligence dependencies
+        run: |
+          python -m pip install -r requirements-piia.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -e . --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test intelligence and evidence integration
+        shell: pwsh
+        run: |
+          $files = (Get-ChildItem tests/test_piia*.py).FullName
+          python -m pytest $files tests/test_liquidity_positioning.py tests/test_research_cycle.py tests/test_chat_decision_gate.py tests/test_current_external_evidence.py tests/test_manual_observation.py tests/test_event_calendar_and_gold.py tests/test_public_research_feeds.py tests/test_polymarket.py tests/test_onchain_integrity.py tests/test_alfred_macro_data.py tests/test_position_tiers_and_margin.py tests/test_research_fusion.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test legacy UTC execution and settlement
+        run: >-
+          python -m pytest tests/test_calendars.py tests/test_cash_weights.py
+          tests/test_fees.py tests/test_lookahead.py tests/test_utc_execution.py tests/test_stale.py
+
+  perps-research:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PIIA_SKIP_NETWORK: "1"
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements-perps.lock
+      - name: Install isolated contract research dependencies
+        run: |
+          python -m pip install -r requirements-perps.lock
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip install -e . --no-deps
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test risk and prospective comparisons
+        run: >-
+          python -m pytest tests/test_perps.py tests/test_perps_compare.py
+          tests/test_frozen_policy_capture.py tests/test_prospective_paper_report.py
+          tests/test_funding_segment_comparison.py tests/test_segmented_forward_v2.py
+          tests/test_forecast_baseline_report.py tests/test_chronological_segments.py
+          tests/test_btc_one_year_price_diagnostic.py tests/test_audit_btc_public_overlap.py
+          tests/test_audit_btc_diagnostic_ledger.py
+          tests/test_btc_fill_trace.py tests/test_three_contract_rolling_diagnostic.py
+          tests/test_audit_forward_shadow_segments.py
+          tests/test_guarded_forecast_report.py
+          tests/test_audit_tardis_funding_sample.py

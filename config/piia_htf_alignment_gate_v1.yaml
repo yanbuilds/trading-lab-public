@@ -1,0 +1,69 @@
+# Frozen candidate eligibility gate for a single diagnostic experiment.
+# Pre-registered before this experiment's gated P&L was computed.
+# Hypothesis is NOT optimized on the already-seen sample and is not a
+# claimed production rule or profitable strategy.
+#
+# id: piia_htf_alignment_gate_v1
+# registered_at_taipei: 2026-11-16 16:48
+#
+# External rationale (not sample-fit):
+# - Higher-timeframe agreement follows a standard multiple-timeframe
+#   trend-confirmation pattern (lower-timeframe entry only if a completed
+#   higher-timeframe trend stack agrees).
+# - "Do not chase an extended move" is a common discretionary / trend
+#   filter. The cap uses one round ATR unit (1.0) from the 1h EMA20, in
+#   the trade direction only. One ATR is a conventional volatility unit,
+#   not a fitted cutoff. It is intentionally distinct from the already
+#   frozen 2*ATR14 stop, which is not changed.
+#
+# This file only versions candidate eligibility. It does not revise any
+# historical researcher, critic, or synthesizer writeup.
+
+id: piia_htf_alignment_gate_v1
+status: frozen_pre_pnl
+hypothesis_optimized: false
+held_out: false
+already_seen_dataset: true
+changes_past_research: false
+changes_stop_or_horizon: false
+label: "H1: take an existing directional paper candidate only if a completed 4h trend stack agrees and the 1h close is not already >= 1.0 ATR14 beyond the 1h EMA20 in the trade direction."
+
+timeframes:
+  entry_clock: "frozen 1h decision close; fill at next 1h open"
+  higher_timeframe: "4h"
+  resampling:
+    rule: "4h"
+    closed: left
+    label: left
+    origin: utc_epoch_aligned
+    include_bar_if: "bar_open + 4h <= decision_clock (completed bars only; exclude any partial current 4h bar)"
+
+four_hour_trend_agrees:
+  description: "Last completed 4h close is on the trade side of both 4h EMA20 and 4h EMA50, and 4h EMA20 is on the trade side of 4h EMA50."
+  long: "close > ema20 and close > ema50 and ema20 > ema50"
+  short: "close < ema20 and close < ema50 and ema20 < ema50"
+  indicators: "same prefix EMA as piia.intelligence.paper.replay.ema"
+  fail_closed_if_undefined: true
+
+not_overextended:
+  description: "Signed extension from 1h EMA20, in the trade direction, must be strictly less than 1.0 times the last completed 1h ATR14."
+  long_extension: "max(0, (close - ema20) / atr14)"
+  short_extension: "max(0, (ema20 - close) / atr14)"
+  threshold_atr: 1.0
+  threshold_source: "conventional one-ATR unit, not fit to this sample"
+  fail_closed_if_undefined: true
+  uses_then_known_closed_1h_only: true
+
+application:
+  lanes:
+    - existing_manual_directional_candidates
+    - existing_independent_directional_candidates
+  does_not_rerun_llm: true
+  same_costs_risk_horizon: true
+  if_all_blocked: "return 0%; win rate undefined; not proof of profitability"
+
+limitations:
+  - "The sample was already seen; this is exploratory, not a holdout."
+  - "A passing or failing filter on a handful of trades cannot validate a strategy."
+  - "Hindsight 72h direction or MFE after a stop is diagnostic only and is not a reason to widen the stop."
+  - "Macro, news, and on-chain data remain missing."

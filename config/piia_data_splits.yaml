@@ -1,0 +1,24 @@
+# Frozen 2026-11-16 (Asia/Taipei). Do not retune windows after seeing new results.
+# This is a documentation freeze, not a guarantee of future data or profitability.
+label: PIIA_EXPERIMENT_SPLITS_V1
+frozen_at_taipei: "2026-11-16"
+held_out: false
+pristine_holdout_available: false
+reserved_forward_start_utc: "2026-11-16T06:00:00+00:00"
+# Bars after the last locked cache candle. Do not evaluate this forward window until
+# it is long enough and a later precommit is recorded. It is not yet a completed holdout.
+windows:
+  reused_exploratory:
+    start_utc: "2026-09-17T06:00:00+00:00"
+    end_last_bar_utc: "2026-11-16T05:00:00+00:00"
+    note: Already used for EMA replay and fixed-parameter strategy comparison. Exploratory only.
+  precommit_earlier:
+    start_utc: "2026-09-01T00:00:00+00:00"
+    end_last_bar_utc: "2026-09-17T05:00:00+00:00"
+    note: Already used once in the strategy comparison. Short and not a certified holdout.
+  warmup_prefix_only:
+    note: Public bars before 2026-09-01 were used as indicator warmup, not as a reserved holdout.
+rules:
+  - Do not retune parameters to make reused windows profitable.
+  - Do not treat chat-assisted or current-model writeups as historical predictions.
+  - 12-month time-series momentum and a 100-day SMA filter are not identifiable on the common BTC/XAU/NDX100 listing history.

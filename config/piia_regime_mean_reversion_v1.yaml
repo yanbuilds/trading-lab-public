@@ -1,0 +1,87 @@
+# Frozen diagnostic hypothesis. Written before any return was computed.
+# Not optimized on this sample. Not a held-out or live strategy.
+# Labels are conventional indicator states, not claimed latent market regimes.
+
+hypothesis_id: range_bollinger_mean_reversion_v1
+hypothesis_optimized: false
+held_out: false
+already_seen_windows: true
+order_permissions: false
+deterministic_experiment: true
+not_a_piia_agent: true
+
+capital_primary_usdt: 100
+capital_optional_feasibility_usdt: 30
+never_mix_capital_books: true
+leverage: 2
+risk_fraction: 0.01
+cash_floor: 0.20
+max_margin_fraction: 0.50
+max_open_positions: 1
+slippage_each_side: 0.0005
+taker_fee: "venue public metadata via existing spec, not a fitted fee"
+stop_atr_multiple: 2.0
+time_stop_hours: 24
+no_martingale: true
+no_grid: true
+no_dca: true
+no_pyramiding: true
+
+regime:
+  adx_period: 14
+  adx_range_below: 20
+  adx_trend_at_or_above: 25
+  # Values in [20, 25) are uncertain and are not tradable under this hypothesis.
+  atr_period: 14
+  atr_mean_period: 50
+  extreme_vol_atr_multiple: 2.0
+  htf: completed_4h_ema20_vs_ema50
+  partial_4h_excluded: true
+  classification_order:
+    - insufficient_data if ADX, ATR, ATR mean, or completed 4h EMAs are undefined
+    - extreme_vol if ATR14 >= 2 * SMA50(ATR14)
+    - range if ADX14 < 20
+    - trend if ADX14 >= 25 and 1h EMA20/EMA50 agrees with completed 4h EMA20/EMA50
+    - uncertain otherwise, including the ADX gray zone and a higher-timeframe conflict
+  no_trade_regimes: [insufficient_data, extreme_vol, uncertain]
+  note: >
+    These are deterministic closed-bar labels for research. They are not proven
+    true hidden states, forecasts, or autonomous agent opinions.
+
+mean_reversion:
+  bollinger_period: 20
+  bollinger_std: 2.0
+  entry: closed 1h close outside the band, fill at the next hour open
+  exit_middle: closed 1h close back through SMA20, exit at the next hour open
+  trend_guard: >
+    Even in a range label, do not buy when completed 4h EMA20 is below EMA50,
+    and do not sell when completed 4h EMA20 is above EMA50. Equal or missing
+    4h EMAs produce no entry.
+  eligible_regime: range
+  stop: same 2 * 1h ATR14 initial stop as the existing trend book
+  time_stop: exit at the open once 24 hours have elapsed since entry, after gap stops
+  signal_timing: next-open, same event order as trading_lab.perps.compare.simulate_book
+
+references:
+  - >
+    John Bollinger, Bollinger on Bollinger Bands, McGraw-Hill, 2002.
+    Default 20-period simple moving average plus or minus two standard deviations.
+    This experiment uses a conventional band-touch mean-reversion outline
+    (enter after a closed excursion, exit toward the middle band), not a claim
+    that Bollinger published a verified futures edge.
+  - >
+    J. Welles Wilder Jr., New Concepts in Technical Trading Systems, 1978.
+    ADX default period 14. Conventional documented interpretation, not a fitted
+    threshold: below 20 often treated as weak or ranging, at or above 25 as
+    trending, 20-25 inconclusive.
+  - >
+    Extreme-volatility gate uses ATR14 at least twice its 50-period simple
+    average. This is a conventional "elevated versus recent average" unit,
+    not optimized on this sample.
+
+limitations:
+  - Not a mature or profitable strategy claim.
+  - Already-seen research windows stay exploratory and are not out-of-sample.
+  - Incomplete or invalid funding forbids net performance reporting.
+  - Liquidation, historical funding schedules, and venue fills remain unverified.
+  - Correlation and concentration risk are not removed by the one-position book.

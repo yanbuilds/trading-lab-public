@@ -1,0 +1,63 @@
+{
+  "$schema": "https://schema.freqtrade.io/schema.json",
+  "strategy": "BitgetBaseline",
+  "trading_mode": "futures",
+  "margin_mode": "isolated",
+  "dry_run": true,
+  "dry_run_wallet": 30,
+  "max_open_trades": 1,
+  "stake_currency": "USDT",
+  "stake_amount": "unlimited",
+  "tradable_balance_ratio": 1.0,
+  "fiat_display_currency": "USD",
+  "timeframe": "1h",
+  "cancel_open_orders_on_exit": true,
+  "unfilledtimeout": {
+    "entry": 5,
+    "exit": 5,
+    "unit": "minutes"
+  },
+  "entry_pricing": {
+    "price_side": "other",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "exit_pricing": {
+    "price_side": "other",
+    "use_order_book": true,
+    "order_book_top": 1
+  },
+  "exchange": {
+    "name": "bitget",
+    "key": "",
+    "secret": "",
+    "password": "",
+    "pair_whitelist": [
+      "BTC/USDT:USDT",
+      "XAU/USDT:USDT",
+      "NDX100/USDT:USDT"
+    ],
+    "pair_blacklist": [],
+    "ccxt_config": {
+      "enableRateLimit": true
+    },
+    "ccxt_async_config": {
+      "enableRateLimit": true
+    }
+  },
+  "pairlists": [
+    {
+      "method": "StaticPairList"
+    }
+  ],
+  "telegram": {
+    "enabled": false,
+    "token": "",
+    "chat_id": ""
+  },
+  "initial_state": "stopped",
+  "force_entry_enable": false,
+  "db_url": "sqlite:///artifacts/bitget-dryrun.sqlite",
+  "bot_name": "bitget-simulation-only",
+  "user_data_dir": "freqtrade/user_data"
+}

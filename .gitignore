@@ -1,0 +1,40 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+data/cache/*
+!data/cache/.gitkeep
+artifacts/*
+!artifacts/.gitkeep
+.streamlit/secrets.toml
+*.log
+.coverage
+htmlcov/
+
+# Never publish user data, provider market data, generated state, or secrets.
+.env.*
+!.env.example
+data/csv/*
+!data/csv/.gitkeep
+*.egg-info/
+*.pem
+*.key
+*.p12
+*.sqlite*
+*.db
+
+# Perpetual contract provider data (never publish downloaded data)
+data/perps/
+freqtrade/user_data/
+data/perps-native/
+data/perps-native-100u/
+
+# PIIA local database, evidence blobs, runtime
+data/piia/**
+!data/piia/.gitkeep
+!data/piia/evidence/
+!data/piia/evidence/.gitkeep
+
+# extended public cache for strategy comparison; do not commit raw OHLCV
+data/perps-extended/
