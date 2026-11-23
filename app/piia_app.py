@@ -71,6 +71,7 @@ try:
         import pandas as _ag2_pd
         from piia.intelligence.agent_v2.continuous_paper import (
             approve_human_proposal,
+            default_ledger_path,
             get_continuous_paper_status,
             run_prospective_cycle,
         )
@@ -89,25 +90,33 @@ try:
         else:
             st.error(f"🚨 冻结校验未通过：{fz['issues']} — 持续前瞻纸面与样本外声明已自动阻断。")
 
-        with st.expander("📊 样本外留出集 (Post-2026-11-16) 与模块消融对照报告", expanded=True):
+        with st.expander("📊 历史回放对照与正交模块消融报告（2026-11-16..11-22 事前冻结未获独立验证）", expanded=True):
             oos_path = _AG2_ROOT / "artifacts" / "piia_v2_oos_ablation.json"
             if not oos_path.is_file():
-                st.info("尚未在本地生成 `artifacts/piia_v2_oos_ablation.json`；可运行 `python -m experiments.run_piia_v2_oos_ablation --fetch-public`。")
+                st.info("尚未在本地生成 `artifacts/piia_v2_oos_ablation.json`（历史归档不包含在 Git 中）；可运行 `python -m experiments.run_piia_v2_oos_ablation --fetch-public` 获取当前公开数据或 `--demo-synthetic` 做工程检验。")
             else:
                 try:
                     oos_doc = _ag2_json.loads(oos_path.read_text(encoding="utf-8"))
                     la_ok = (oos_doc.get("prefix_truncation_lookahead_audit") or {}).get("ok")
                     st.caption(
-                        f"评估生成时间 UTC: {oos_doc.get('evaluated_at_utc')} | 数据集哈希: `{str(oos_doc.get('dataset_sha256'))[:16]}...` | "
+                        f"版本: `v{oos_doc.get('version')}` | 生成时间 UTC: {oos_doc.get('evaluated_at_utc')} | 数据集哈希: `{str(oos_doc.get('dataset_sha256'))[:16]}...` | "
                         f"前缀截断无前视检验: `{'PASS' if la_ok else 'UNVERIFIED'}` | 冻结后调参: `{oos_doc.get('tuning_performed_after_freeze')}`"
                     )
+                    if oos_doc.get("module_execution_summary"):
+                        st.caption("模块执行核验：" + ", ".join(
+                            f"{k}={'已运行' if v.get('executed') else '未运行'}"
+                            for k, v in oos_doc["module_execution_summary"].items()
+                        ))
                     win_sel = st.selectbox(
                         "选择评估窗口",
                         list((oos_doc.get("windows") or {}).keys()),
                         key="ag2_win_sel",
                     )
                     book_sel = st.selectbox("选择独立本金账本", ["book_100u", "book_500u"], index=1, key="ag2_book_sel")
-                    win_obj = ((oos_doc.get("windows") or {}).get(win_sel) or {}).get(book_sel) or {}
+                    win_meta = (oos_doc.get("windows") or {}).get(win_sel) or {}
+                    if win_meta.get("note"):
+                        st.warning(f"{win_meta.get('label', '')}: {win_meta['note']}")
+                    win_obj = win_meta.get(book_sel) or {}
                     base_res = win_obj.get("base_cost_results") or {}
                     stress_res = win_obj.get("stress_2x_slippage_results") or {}
                     if base_res:
@@ -115,17 +124,18 @@ try:
                         for arm_k, item in base_res.items():
                             st_item = stress_res.get(arm_k) or {}
                             tbl.append({
-                                "实验臂 (基线 / 消融)": arm_k,
+                                "实验臂 (基线 / 正交开关)": arm_k,
                                 "期末权益(U)": item.get("final_usdt"),
-                                "净收益率(%)": item.get("return_pct"),
+                                "净收益率(%)": item.get("net_return_pct") if item.get("net_return_pct") is not None else "未知(缺资金费)",
                                 "最大回撤(%)": item.get("max_drawdown_pct"),
-                                "2x滑点压力收益(%)": st_item.get("return_pct"),
+                                "2x滑点压力收益(%)": st_item.get("net_return_pct") if st_item.get("net_return_pct") is not None else st_item.get("return_pct"),
                                 "平仓笔数": item.get("closed_trades"),
-                                "胜率(%)": item.get("winrate_pct"),
+                                "持仓时间占比": item.get("exposure_bar_fraction"),
+                                "平均名义敞口倍数": item.get("avg_notional_exposure_ratio"),
+                                "换手倍数": item.get("turnover_multiple"),
                                 "手续费(U)": item.get("fees_paid_usdt"),
                                 "资金费净支出(U)": item.get("funding_net_paid_usdt"),
-                                "持仓时间占比": item.get("exposure_bar_fraction"),
-                                "触发停机": item.get("loss_halt_triggered"),
+                                "停机状态": item.get("loss_halt_reason") or ("停机" if item.get("loss_halt_triggered") else "正常"),
                             })
                         st.dataframe(_ag2_pd.DataFrame(tbl), width="stretch")
                 except Exception as exc:
@@ -135,38 +145,77 @@ try:
         st.subheader("⏱️ 持续前瞻纸面交易与可追溯决策账本 (Append-Only SQLite)")
         ag_c1, ag_c2, ag_c3 = st.columns(3)
         ag_cash = ag_c1.number_input("初始模拟本金 (USDT)", min_value=50.0, max_value=1_000_000.0, value=500.0, step=50.0, key="ag2_start_cash")
-        if ag_c2.button("🚀 运行本小时全证据前瞻周期 (实时公开源)", key="ag2_btn_live_cycle"):
+        if ag_c2.button("🚀 运行本小时全证据前瞻周期 (实时公开源 · 真实账本)", key="ag2_btn_live_cycle"):
             try:
-                with st.spinner("正在核验冻结清单并采集六大公开证据支柱（行情/盘口/档位/宏观/ETF/COT/链上/Polymarket/预测）..."):
-                    st.session_state["ag2_last_cycle"] = run_prospective_cycle(starting_cash=float(ag_cash), demo_mode=False)
+                with st.spinner("正在核验冻结清单、三合约 K 线对齐并采集六大公开证据支柱..."):
+                    st.session_state["ag2_last_cycle"] = run_prospective_cycle(
+                        db_path=default_ledger_path(demo=False), starting_cash=float(ag_cash), demo_mode=False
+                    )
             except Exception as exc:
                 st.error(f"实时前瞻周期运行失败：{exc}")
-        if ag_c3.button("🧪 运行合成演示前瞻周期 (离线)", key="ag2_btn_demo_cycle"):
+        if ag_c3.button("🧪 运行合成演示前瞻周期 (离线 · 独立演示账本)", key="ag2_btn_demo_cycle"):
             try:
-                st.session_state["ag2_last_cycle"] = run_prospective_cycle(starting_cash=float(ag_cash), demo_mode=True)
+                st.session_state["ag2_last_cycle"] = run_prospective_cycle(
+                    db_path=default_ledger_path(demo=True), starting_cash=float(ag_cash), demo_mode=True
+                )
             except Exception as exc:
                 st.error(f"离线演示周期运行失败：{exc}")
 
         if st.session_state.get("ag2_last_cycle"):
-            st.json(st.session_state["ag2_last_cycle"])
+            last_res = st.session_state["ag2_last_cycle"]
+            if str(last_res.get("status") or "").startswith("rejected_"):
+                st.warning(f"本轮周期未写入账本（`{last_res.get('status')}`）：{last_res.get('reasons')}")
+            st.json(last_res)
 
-        cp_status = get_continuous_paper_status()
+        ag_view = st.radio(
+            "查看账本", ["真实前瞻账本", "合成演示账本"], horizontal=True, key="ag2_ledger_view",
+        )
+        ag_demo_view = ag_view == "合成演示账本"
+        cp_status = get_continuous_paper_status(default_ledger_path(demo=ag_demo_view), demo=ag_demo_view)
+        pv = cp_status.get("prospective_validation") or {}
+        audit_cur = cp_status.get("ledger_audit") or {}
+        st.caption(
+            f"前瞻验证状态: **{cp_status.get('validation_status')}** — {cp_status.get('validation_note', '')} | "
+            f"计入验证的真实观测: **{pv.get('counted_observations', 0)}** 小时 | "
+            f"最长连续: **{pv.get('longest_contiguous_hours', 0)}** 小时（要求 {pv.get('required_contiguous_hours')}） | "
+            f"观测区间内缺失: **{pv.get('missing_hours_within_observed_span', 0)}** 小时 | "
+            f"冻结起算 `{pv.get('freeze_started_utc')}` 以来缺失: **{pv.get('missing_hours_since_freeze')}** 小时"
+        )
+        if audit_cur.get("exists") and not ag_demo_view and not audit_cur.get("usable_as_live_prospective_ledger"):
+            st.error(
+                f"当前真实账本 `{audit_cur.get('db_path')}` 不可用于当前前瞻验证（"
+                f"classification=`{audit_cur.get('classification')}`）：{' '.join(audit_cur.get('notes') or [])}"
+            )
+        for lg in cp_status.get("legacy_ledgers") or []:
+            st.warning(
+                f"旧账本 `{lg.get('db_path')}`（{lg.get('ledger_kind_label')}, {lg.get('classification')}）已原样保留、"
+                f"不写入、不计入 v2.2 验证：{' '.join(lg.get('notes') or [])}"
+            )
         if not cp_status.get("initialized"):
-            st.info("本地持续纸面账本 (`data/piia/piia_v2_continuous.sqlite`) 尚无记录；点击上方按钮即可记录首个可追溯周期。")
+            st.info(f"账本 `{cp_status.get('db_path')}` 尚无记录。")
         else:
             st.caption(
-                f"已累计记录前瞻周期数: **{cp_status['cycles_recorded']}** | 首周期: `{cp_status['first_cutoff_utc']}` | "
-                f"最新周期: `{cp_status['latest_cutoff_utc']}` (`{cp_status['latest_mode']}`)"
+                f"账本类型: `{cp_status.get('ledger_kind')}` | 账本内周期记录数（不等于前瞻验证小时数）: {cp_status['cycles_recorded']} | "
+                f"首周期: `{cp_status['first_cutoff_utc']}` | 最新周期: `{cp_status['latest_cutoff_utc']}` (`{cp_status['latest_mode']}`)"
             )
             b_rows = []
             for b_k, b_v in (cp_status.get("books") or {}).items():
                 op = b_v.get("open_position")
+                net_disp = (
+                    b_v["realized_net_pnl_usdt"]
+                    if b_v.get("net_return_claim_allowed", True)
+                    else "未知(缺已核验资金费)"
+                )
                 b_rows.append({
                     "对照账本": b_k,
                     "初始资金(U)": b_v["starting_cash_usdt"],
                     "当前现金(U)": b_v["cash_usdt"],
                     "已平仓笔数": b_v["closed_trades"],
-                    "已实现净损益(U)": b_v["realized_net_pnl_usdt"],
+                    "已实现净损益(U)": net_disp,
+                    "已知资金费(U)": b_v.get("known_funding_paid_usdt"),
+                    "资金费完整": b_v.get("funding_complete"),
+                    "停机锁定": b_v.get("halt_reason") or ("停机" if b_v.get("halted") else "正常"),
+                    "对账误差": b_v.get("reconciliation_error_usdt"),
                     "当前持仓": f"{op['symbol']} {op['side']} {op['qty']}@{op['entry']:.2f} (SL={op['stop']:.2f})" if op else "空仓",
                 })
             st.dataframe(_ag2_pd.DataFrame(b_rows), width="stretch")
@@ -178,6 +227,7 @@ try:
                 ):
                     st.write("保留的角色分歧 (Disagreements):", tr_d.get("disagreements") or ["无分歧"])
                     st.json({
+                        "module_execution": tr_d.get("module_execution"),
                         "entry_plan": tr_d.get("entry_plan"),
                         "exit_plan": tr_d.get("exit_plan"),
                         "position_sizing": tr_d.get("position_sizing"),
@@ -194,7 +244,10 @@ try:
                 sel_note = st.text_input("审批备注", "", key="ag2_sel_note")
                 if st.button("提交人工纸面审批决定", key="ag2_btn_approve"):
                     try:
-                        dec_out = approve_human_proposal(sel_pid, choice=sel_choice, note=sel_note)
+                        dec_out = approve_human_proposal(
+                            sel_pid, choice=sel_choice, note=sel_note,
+                            db_path=default_ledger_path(demo=ag_demo_view),
+                        )
                         st.success(f"已完成人工纸面决策：{dec_out['choice']}")
                         st.json(dec_out)
                     except Exception as exc:

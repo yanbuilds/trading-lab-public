@@ -82,10 +82,14 @@ def main(argv: list[str] | None = None) -> int:
     p_arun = sub.add_parser("agent-run", help="run one prospective PIIA v2 6-pillar cycle and append to continuous paper ledger")
     p_arun.add_argument("--demo", action="store_true", help="run on labeled synthetic snapshot without network")
     p_arun.add_argument("--starting-cash", type=float, default=500.0)
-    p_arun.add_argument("--db", default=None, help="optional sqlite path (defaults to data/piia/piia_v2_continuous.sqlite)")
+    p_arun.add_argument("--db", default=None, help="optional sqlite path (defaults: live -> data/piia/piia_v2_2_live_prospective.sqlite, --demo -> data/piia/piia_v2_2_demo_synthetic.sqlite)")
 
     p_astat = sub.add_parser("agent-status", help="inspect PIIA v2 continuous prospective paper ledger & shadow baseline comparison")
     p_astat.add_argument("--db", default=None)
+    p_astat.add_argument("--demo", action="store_true", help="inspect the synthetic demo ledger instead of the live ledger")
+
+    p_ainsp = sub.add_parser("agent-inspect-ledger", help="read-only compatibility audit of a PIIA v2 ledger (detects mixed demo/live data)")
+    p_ainsp.add_argument("--db", default=None, help="ledger path; omit to audit the live, demo and legacy ledgers")
 
     p_aapp = sub.add_parser("agent-approve", help="explicitly approve or reject a pending PIIA v2 human paper proposal (never live)")
     p_aapp.add_argument("--proposal-id", required=True)
@@ -93,6 +97,7 @@ def main(argv: list[str] | None = None) -> int:
     p_aapp.add_argument("--actor", default="local-investor")
     p_aapp.add_argument("--note", default="")
     p_aapp.add_argument("--db", default=None)
+    p_aapp.add_argument("--demo", action="store_true", help="decide a proposal stored in the synthetic demo ledger")
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parents[3]
@@ -304,22 +309,30 @@ def main(argv: list[str] | None = None) -> int:
         return 0 if res["ok"] else 2
     if args.cmd == "agent-run":
         import json
-        from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH, run_prospective_cycle
-        db_p = Path(args.db) if args.db else DEFAULT_LEDGER_PATH
+        from piia.intelligence.agent_v2.continuous_paper import default_ledger_path, run_prospective_cycle
+        db_p = Path(args.db) if args.db else default_ledger_path(demo=args.demo)
         res = run_prospective_cycle(db_path=db_p, starting_cash=args.starting_cash, demo_mode=args.demo)
         print(json.dumps(res, indent=2, ensure_ascii=False, default=str))
-        return 0
+        return 0 if res.get("status") in {"recorded_prospective_cycle", "already_recorded_for_hour"} else 3
     if args.cmd == "agent-status":
         import json
-        from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH, get_continuous_paper_status
-        db_p = Path(args.db) if args.db else DEFAULT_LEDGER_PATH
-        res = get_continuous_paper_status(db_path=db_p)
+        from piia.intelligence.agent_v2.continuous_paper import default_ledger_path, get_continuous_paper_status
+        db_p = Path(args.db) if args.db else default_ledger_path(demo=args.demo)
+        res = get_continuous_paper_status(db_path=db_p, demo=args.demo)
         print(json.dumps(res, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.cmd == "agent-inspect-ledger":
+        import json
+        from piia.intelligence.agent_v2.continuous_paper import (
+            LEGACY_LEDGER_PATHS, default_ledger_path, inspect_ledger,
+        )
+        targets = [Path(args.db)] if args.db else [default_ledger_path(False), default_ledger_path(True), *LEGACY_LEDGER_PATHS]
+        print(json.dumps([inspect_ledger(t) for t in targets], indent=2, ensure_ascii=False, default=str))
         return 0
     if args.cmd == "agent-approve":
         import json
-        from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH, approve_human_proposal
-        db_p = Path(args.db) if args.db else DEFAULT_LEDGER_PATH
+        from piia.intelligence.agent_v2.continuous_paper import default_ledger_path, approve_human_proposal
+        db_p = Path(args.db) if args.db else default_ledger_path(demo=args.demo)
         res = approve_human_proposal(
             args.proposal_id, choice=args.choice, actor=args.actor, note=args.note, db_path=db_p
         )

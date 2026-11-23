@@ -26,7 +26,9 @@ def run_independent_researcher(
     *,
     cfg: dict[str, Any] | None = None,
     enable_macro: bool = True,
-    enable_forecast: bool = True,
+    enable_stat_forecast: bool | None = None,
+    enable_neural_forecast: bool = False,
+    enable_forecast: bool | None = None,
     enable_live_external: bool = True,
 ) -> dict[str, Any]:
     """Form an isolated directional hypothesis from frozen evidence ONLY."""
@@ -35,6 +37,12 @@ def run_independent_researcher(
     cfg = cfg or load_v2_config()
     mcfg = cfg["evidence_pillars"]["market"]
     rcfg = cfg["roles_and_gates"]
+    use_stat_forecast = (
+        enable_stat_forecast
+        if enable_stat_forecast is not None
+        else (True if enable_forecast is None else bool(enable_forecast))
+    )
+    use_neural_forecast = bool(enable_neural_forecast)
 
     pillars = bundle["pillars"]
     mkt = pillars["market"]
@@ -175,19 +183,27 @@ def run_independent_researcher(
         else:
             missing_notes.append("macro_context_unavailable")
 
-    if enable_forecast:
+    if use_stat_forecast or use_neural_forecast:
         fc = pillars["forecast"]
         citations.append(fc["evidence_hash"])
         neural = fc.get("neural_chronos") or {}
         stat = fc.get("statistical_drift") or {}
-        horizon_est = neural.get("q50_24h") if neural.get("available") else stat.get("point_24h")
-        if horizon_est is not None and direction in {"long", "short"}:
-            if (direction == "long" and float(horizon_est) > close_px) or (direction == "short" and float(horizon_est) < close_px):
+        if use_neural_forecast and neural.get("available") and direction in {"long", "short"}:
+            n_est = neural.get("q50_24h")
+            if n_est is not None and (
+                (direction == "long" and float(n_est) > close_px)
+                or (direction == "short" and float(n_est) < close_px)
+            ):
                 score += 0.15
-                supporting_notes.append("24h uncalibrated forecast drift aligns with proposed direction.")
-        else:
-            if not stat.get("available"):
-                missing_notes.append("forecast_history_insufficient")
+                supporting_notes.append("Neural Chronos 24h q50 aligns with proposed direction.")
+        elif use_stat_forecast:
+            s_est = stat.get("point_24h") if stat.get("available") else None
+            if s_est is not None and direction in {"long", "short"}:
+                if (direction == "long" and float(s_est) > close_px) or (direction == "short" and float(s_est) < close_px):
+                    score += 0.15
+                    supporting_notes.append("24h uncalibrated statistical drift benchmark aligns with proposed direction.")
+            elif not stat.get("available"):
+                missing_notes.append("statistical_forecast_history_insufficient")
 
     if enable_live_external:
         for pname in ("flows_positioning", "onchain", "polymarket", "event_calendar"):
@@ -298,12 +314,16 @@ def run_critic_adversarial_veto(
     critic_pass1: dict[str, Any],
     *,
     cfg: dict[str, Any] | None = None,
-    enable_macro: bool = True,
-    enable_forecast: bool = True,
-    enable_critic_veto: bool = True,
+    enable_cost_gate: bool | None = None,
+    enable_macro_filter: bool | None = None,
+    enable_stat_forecast_filter: bool | None = None,
+    enable_neural_forecast_filter: bool = False,
+    enable_macro: bool | None = None,
+    enable_forecast: bool | None = None,
+    enable_critic_veto: bool | None = None,
     enable_live_external: bool = True,
 ) -> dict[str, Any]:
-    """Pass-2 Adversarial Critic: checks pre-frozen veto conditions against Researcher's proposal."""
+    """Pass-2 Adversarial Critic: applies orthogonal, independently toggleable veto checks."""
     cfg = cfg or load_v2_config()
     rcfg = cfg["roles_and_gates"]
     fcfg = cfg["evidence_pillars"]["forecast"]
@@ -313,60 +333,86 @@ def run_critic_adversarial_veto(
     fc = pillars["forecast"]
     flows = pillars["flows_positioning"]
 
+    use_cost_gate = (
+        enable_cost_gate
+        if enable_cost_gate is not None
+        else (True if enable_critic_veto is None else bool(enable_critic_veto))
+    )
+    use_macro_filter = (
+        enable_macro_filter
+        if enable_macro_filter is not None
+        else (True if enable_macro is None else bool(enable_macro))
+    )
+    use_stat_fc_filter = (
+        enable_stat_forecast_filter
+        if enable_stat_forecast_filter is not None
+        else (True if enable_forecast is None else bool(enable_forecast))
+    )
+    use_neural_fc_filter = bool(enable_neural_forecast_filter)
+
     direction = researcher_out.get("direction") or "stand_aside"
     veto_reasons: list[str] = []
     cautions: list[str] = list(critic_pass1.get("risk_flags") or [])
 
-    if direction in {"long", "short"} and enable_critic_veto:
+    if direction in {"long", "short"}:
         sign = 1.0 if direction == "long" else -1.0
         close_px = float(mkt["ohlc"]["close"])
         atr14 = float(mkt.get("atr14") or 0.0)
         stop_mult = float(researcher_out.get("proposed_stop_atr_mult") or 2.0)
 
-        # 1. Extreme volatility veto
-        if "extreme_volatility_regime" in cautions:
-            veto_reasons.append("veto_extreme_volatility")
+        if use_cost_gate:
+            # 1. Extreme volatility veto
+            if "extreme_volatility_regime" in cautions:
+                veto_reasons.append("veto_extreme_volatility")
 
-        # 2. Friction share of 1R veto
-        round_trip_cost_pct = 2.0 * (
-            float(cfg["risk_and_costs"]["taker_fee_fallback"])
-            + float(cfg["risk_and_costs"]["slippage_each_side_base"])
-        )
-        stop_pct = (stop_mult * atr14 / close_px) if (close_px > 0 and atr14 > 0) else 0.0
-        if stop_pct <= 0 or (round_trip_cost_pct / stop_pct) > float(rcfg["critic_max_friction_share_of_1r"]):
-            veto_reasons.append("veto_cost_to_volatility_drag")
+            # 2. Friction share of 1R veto
+            round_trip_cost_pct = 2.0 * (
+                float(cfg["risk_and_costs"]["taker_fee_fallback"])
+                + float(cfg["risk_and_costs"]["slippage_each_side_base"])
+            )
+            stop_pct = (stop_mult * atr14 / close_px) if (close_px > 0 and atr14 > 0) else 0.0
+            if stop_pct <= 0 or (round_trip_cost_pct / stop_pct) > float(rcfg["critic_max_friction_share_of_1r"]):
+                veto_reasons.append("veto_cost_to_volatility_drag")
 
-        # 3. Adverse contemporaneous funding crowding veto
-        f_rate = mkt.get("funding_rate_8h")
-        if f_rate is not None:
-            adverse_funding = sign * float(f_rate)  # >0 means trader pays funding
-            if adverse_funding > float(rcfg["critic_max_adverse_funding_8h"]):
-                veto_reasons.append("veto_adverse_funding_crowding")
+            # 3. Adverse contemporaneous funding crowding veto
+            f_rate = mkt.get("funding_rate_8h")
+            if f_rate is not None:
+                adverse_funding = sign * float(f_rate)  # >0 means trader pays funding
+                if adverse_funding > float(rcfg["critic_max_adverse_funding_8h"]):
+                    veto_reasons.append("veto_adverse_funding_crowding")
 
-        # 4. Higher-timeframe conflict veto
-        htf20, htf50 = mkt.get("htf_ema20_4h"), mkt.get("htf_ema50_4h")
-        if htf20 is not None and htf50 is not None:
-            if (direction == "long" and float(htf20) < float(htf50)) or (
-                direction == "short" and float(htf20) > float(htf50)
-            ):
-                veto_reasons.append("veto_higher_timeframe_conflict")
+            # 4. Higher-timeframe conflict veto
+            htf20, htf50 = mkt.get("htf_ema20_4h"), mkt.get("htf_ema50_4h")
+            if htf20 is not None and htf50 is not None:
+                if (direction == "long" and float(htf20) < float(htf50)) or (
+                    direction == "short" and float(htf20) > float(htf50)
+                ):
+                    veto_reasons.append("veto_higher_timeframe_conflict")
 
-        # 5. Point-in-time Macro headwind veto (when macro module enabled)
-        if enable_macro and mac.get("status") == "available":
+        # 5. Point-in-time Macro headwind veto (independent toggle!)
+        if use_macro_filter and mac.get("status") == "available":
             if direction == "long" and mac.get("macro_tightening_headwind"):
                 veto_reasons.append("veto_macro_real_yield_dollar_headwind")
             elif direction == "short" and mac.get("macro_easing_tailwind"):
                 veto_reasons.append("veto_macro_real_yield_dollar_tailwind_against_short")
 
-        # 6. Forecast strong opposing move veto (when forecast module enabled)
-        if enable_forecast and atr14 > 0:
-            neural = fc.get("neural_chronos") or {}
+        # 6a. Statistical 168h drift opposing move veto (independent toggle!)
+        if use_stat_fc_filter and atr14 > 0:
             stat = fc.get("statistical_drift") or {}
-            pt = neural.get("q50_24h") if neural.get("available") else stat.get("point_24h")
+            pt = stat.get("point_24h") if stat.get("available") else None
             if pt is not None:
                 expected_delta = sign * (float(pt) - close_px)
                 if expected_delta < -float(fcfg["opposing_move_veto_atr_mult"]) * atr14:
-                    veto_reasons.append("veto_forecast_strong_opposing_drift")
+                    veto_reasons.append("veto_stat_forecast_strong_opposing_drift")
+
+        # 6b. Neural Chronos opposing move veto (only if Chronos weights actually executed!)
+        if use_neural_fc_filter and atr14 > 0:
+            neural = fc.get("neural_chronos") or {}
+            n_pt = neural.get("q50_24h") if neural.get("available") else None
+            if n_pt is not None:
+                expected_delta_n = sign * (float(n_pt) - close_px)
+                if expected_delta_n < -float(fcfg["opposing_move_veto_atr_mult"]) * atr14:
+                    veto_reasons.append("veto_neural_chronos_strong_opposing_drift")
 
         # 7. Live external liquidity / ETF outflow / deleveraging checks
         if enable_live_external:
@@ -386,6 +432,13 @@ def run_critic_adversarial_veto(
         "role": "critic_adversarial_pass2",
         "symbol": bundle["symbol"],
         "reviewed_researcher_hash": researcher_out["output_hash"],
+        "switches_applied": {
+            "cost_gate": use_cost_gate,
+            "macro_filter": use_macro_filter,
+            "stat_forecast_filter": use_stat_fc_filter,
+            "neural_forecast_filter": use_neural_fc_filter,
+            "live_external": bool(enable_live_external),
+        },
         "vetoed": bool(veto_reasons),
         "veto_reasons": veto_reasons,
         "cautions_retained": cautions,

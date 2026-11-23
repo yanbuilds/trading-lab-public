@@ -3,6 +3,7 @@ from copy import deepcopy
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from piia.intelligence.agents.workflow import run_workflow
 from piia.intelligence.clock import Clock
 from piia.intelligence.errors import NotFound, ValidationFailed
 from piia.intelligence.hashing import content_hash
@@ -66,7 +67,6 @@ class ExtendedService:
                 cached["independent_llm_review"] = "NOT_WIRED"
                 cached["result"] = {**(cached.get("result") or {}), "independent_llm_review": "NOT_WIRED"}
             return cached
-        from piia.intelligence.agents.workflow import run_workflow
         result = run_workflow(mode=mode, payload=payload, legal_evidence_ids=ev_ids)
         # Fixture and unconfigured responses are deterministic. A configured
         # model call may be billable and nondeterministic, so each invocation

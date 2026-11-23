@@ -6,26 +6,22 @@
 
 ---
 
-## 核心架构与验证闭环（PIIA v2）
+## 核心架构与验证闭环（PIIA v2.2）
 
-详见预注册冻结协议 [PIIA_V2_PROTOCOL.md](PIIA_V2_PROTOCOL.md) 与真实数据样本外检验报告 [PIIA_V2_EVALUATION_REPORT.md](PIIA_V2_EVALUATION_REPORT.md)：
+详见预注册协议 [PIIA_V2_PROTOCOL.md](PIIA_V2_PROTOCOL.md)、最新冻结规范 [PIIA_V2_2_FREEZE.md](PIIA_V2_2_FREEZE.md)（v2.1 记录保留于 [PIIA_V2_1_FREEZE.md](PIIA_V2_1_FREEZE.md)） 与真实数据正交归因报告 [PIIA_V2_EVALUATION_REPORT.md](PIIA_V2_EVALUATION_REPORT.md)：
 
-1. **六大公开证据支柱融合（`src/piia/intelligence/agent_v2/pillars.py`）**
-   - **行情与微观结构**：闭合 `1h/4h/1d` K 线、因果指标、实时双边盘口可见深度、逐仓维持保证金档位、公开资金费率与持仓量（OI）。
-   - **宏观与官方日历**：ALFRED 10Y 实际利率（`DFII10`）、名义美债（`DGS10` / `DGS2`）、广义美元指数（`DTWEXBGS`）与高危通胀预期（`T5YIFR`），严格施加发布滞后门控（历史回放对日频序列保守延迟 `+2` 自然日），叠加美联储 / BLS / BEA 官方日程。
-   - **资金流与仓位结构**：美国现货 BTC ETF 净流入（Farside / TFTC 双源核验）、COMEX 黄金 COT 管理基金净头寸（按周五 20:30 UTC CFTC 发布门控）、跨市场流动性脆弱性评估。
-   - **链上状态**：`mempool.space` 区块高度、未确认池拥堵与推荐费率压力。
-   - **预测市场赔率**：Polymarket（Gamma + CLOB）宏观与加密事件实时双边盘口隐含概率（剔除过期/单边/交叉盘口，不冒充校准概率）。
-   - **预测模型与统计基准**：优先绑定本地隔离缓存 Chronos 分位数预测，未安装权重时自动回退至诚实标注的 `168h` 因果漂移—波动率不确定性区间基准（`statistical_drift_vol_168h`）。
-2. **上下文隔离角色审查与确定性程序化风控（`roles.py` / `risk_gate.py`）**
-   - **独立研究方（`Researcher`）** 与 **首轮独立反方（`Critic Pass 1`）** 接收同一冻结证据快照，代码级强制断言互不可见对方输出；随后 **对抗审查（`Critic Pass 2`）** 针对研究方提案逐条核查成本拖累（`2.2 * ATR < 3.5 * 往返成本`）、资金费拥挤、宏观逆风、预测区间过宽与链上/盘口摩擦；**综合角色（`Synthesizer`）** 汇总双方并完整保留分歧记录（`disagreements`），可选接入白名单官方大模型文本复核（`research-cycle`，仍声明 `independent_llm_review = "NOT_WIRED"`，无权推翻程序门控）。
-   - **程序化确定性风控门控（`ProgrammaticRiskGate`）**：计算向下取整合约张数、单笔止损预算上限（`1.0%` 权益）、含双边手续费保本价、`+1.5R` 推保本、`22` 周期吊灯跟踪止损、`48h` 时间止损、估算逐仓强平缓冲（止损前至少保留 `35%` 清算缓冲）与累计亏损 `-10%` 账户熔断，输出唯一可追溯 `decision_id` 的 **做多（`long`）/ 做空（`short`）/ 观望（`stand_aside`）** 决策。
-3. **样本外与模块消融实证结论摘要（如实披露，零调参）**
-   - 在冻结清单哈希（`manifest_sha256 = 17b31673...`）后对 Bitget 三合约 2,208 根连续真实 `1h` K 线与完整历史资金费做一次性检验（前缀截断无前视检验 3 个切点闭合交易 **100% 逐笔一致**）：
-     - **冻结后未见样本外窗口（`2026-11-16 06:00Z → 2026-11-22 23:00Z`，162 小时）**：`M4_full_piia_v2` 净收益 `+0.603%`（100U）/ `+0.555%`（500U，MaxDD `2.38%`），优于未加反方审查的纯研究信号 `M1`（`-0.089%` / `-0.057%`）、`B4_v1_range_bollinger`（`+0.255%` / `+0.273%`）与现金 `B0`（`0.00%`）；**但显著跑输仅交易 1 笔的低换手 `B2_aligned_ema_4h`（`+2.460%` / `+2.549%`）与 `B3_donchian_breakout_4h`（`+1.848%` / `+2.122%`）**，且在 `2x` 双倍滑点压力下因 10 笔换手转为 `-1.240%`。
-     - **冻结前 73 天震荡探索窗口（`2026-09-04 → 2026-11-16 05:00Z`，1,746 小时）**：简单基线 `B1`、`B3`、`B4` 与无反方门控 `M1`（`-10.55%`，73 笔）全部触发 `-10%` 停机熔断；`M4_full_piia_v2` 借助反方 **145 次成本拖累否决** 将亏损与手续费压缩超一半（100U `-4.92%` / 500U `-4.82%`，MaxDD `7.85%`，未触发熔断），但仍跑输空仓现金 `B0`（`0.00%`），且滞后日频宏观（`M2`）与统计漂移预测（`M3`）在该区间内增量贡献极小。
-4. **持续前瞻纸面交易双账本（`continuous_paper.py`）**
-   - 追加式 SQLite 账本（`UPDATE/DELETE` 触发器锁死），同步维护自动影子对照账本（`M4_full_piia_v2` vs `B1` / `B3` / `B0_cash`）与需人工显式审批的纸面提案账本（`human_approved_paper`）。
+1. **六大公开证据支柱与严格防泄漏边界（`src/piia/intelligence/agent_v2/pillars.py`）**
+   - **行情与已结算资金费**：闭合 `1h/4h/1d` K 线、因果指标、实时盘口与保证金档位；持续纸面采用 Bitget 公开 `history-fund-rate` 与周期核验，任一时点缺失标为 `funding_unknown` 且禁止宣称净收益。
+   - **宏观与官方日历**：ALFRED `DFII10` / `DGS10` / `DGS2` / `DTWEXBGS` 等（历史回放保守 `+2` 自然日滞后）+ 美联储/BLS/BEA 日历。
+   - **资金流与仓位结构 / 链上 / Polymarket / 预测基准**：US Spot BTC ETF 净流、COMEX 黄金 COT、`mempool.space` 链上拥堵与 Gamma+CLOB 实时双边赔率仅用于前瞻实时采集（历史回放标为 `not_available_point_in_time`，绝不回填）；无本地缓存权重时 `Chronos` 保持 `not_executed_weights_absent`，仅运行诚实标注 `not_calibrated` 的 `168h` 统计漂移基准。
+2. **上下文隔离、正交开关与确定性程序风控（`roles.py` / `risk_gate.py`）**
+   - `Researcher` 与 `Critic Pass 1` 强制代码级上下文隔离；`Critic Pass 2` 的**成本门控（`cost_gate`）、宏观过滤（`macro_filter`）与统计预测过滤（`stat_forecast_filter`）已拆分为完全正交可独立开关的因素**；外部大模型保持 `NOT_WIRED`，且任何外部观点均无法覆盖 `ProgrammaticRiskGate` 与跨重启持久化的 `3%` 单日 / `10%` 总损失停机。
+3. **正交消融实证结论摘要（如实披露，零调参，前瞻状态待完成）**
+   - **`2026-11-16 06:00Z → 11-22 23:00Z` 明确重标为“历史回放，事前冻结未获独立验证”**（同提交哈希仅证文件一致）；若本地 gitignored 归档 `data/piia_v2_eval/` 无法取得，则原结果未复现（`--demo-synthetic` 仅供工程测试）。
+   - 解耦 `cost_gate` 后验证：**`M2b_macro_only`（`-10.16%`，总停机）与 `M2c_stat_forecast_only`（`-10.55%`，总停机）单独均无明显减亏能力**；从 `M1` 到 `M4` 的全部回撤/换手改善均来自 **`M2a_cost_gate_only`（73 天探索期由 `-10.55%` 降至 `-4.92%`，免于停机，换手 `121.46x -> 41.92x`）**。但整体在 73 天震荡期均跑输空仓现金 `0.00%`，且在 `11-16..11-22` 回放中因高换手跑输极简 `4h EMA`（`+2.549%`）并在 `2x` 滑点转负（`-1.337%`）。
+   - **前瞻观察状态**：`v2.2.0` 冻结后从全新真实账本重新计数；只计入冻结后、当前冻结代码按时记录的真实观测，按最长连续小时判定（要求 >= 168 连续小时，达到后也只进入待审计），当前为 **待验证（`PENDING_INSUFFICIENT_PROSPECTIVE_SAMPLE`）**。
+4. **加固版持续纸面交易双账本（`continuous_paper.py`）**
+   - 真实采集只写 `data/piia/piia_v2_2_live_prospective.sqlite`、演示只写 `data/piia/piia_v2_2_demo_synthetic.sqlite`（底层按账本标签拒绝混写；旧账本只读审计：`python -m piia agent-inspect-ledger`）；三合约最新收盘不一致时整周期拒绝写入，同步追踪 `B0_cash` / `B1` / `B2` / `B3` / `M4` 的 `1x` 与 `2x` 滑点影子对照以及人工审批账本；内置停机恢复、已处理 K 线游标持久化、不溯及既往止损更新、严格资金费缺失封锁及审批前报价时效/漂移/仓位/余额/停机全重验。
 5. **🎯 个人交易辅助工具箱（`scan` / `plan-trade` / `position-advice`）**
    - 提供三大合约实时盘面雷达、下单前精确张数/含费保本价/`TP1–TP3` 分批止盈阶梯/强平缓冲工单计算器，以及盘中移动止损诊断顾问。
 
@@ -37,14 +33,14 @@ $env:PYTHONPATH = "src;."
 # 1. 核验 PIIA v2 预注册冻结规则与源码 SHA-256 完整性
 python -m piia agent-verify-freeze
 
-# 2. 执行本小时真实六支柱采集、独立研究+反方审查+确定性风控，并写入持续纸面交易账本（离线演示加 --demo）
+# 2. 执行本小时真实六支柱采集并写入真实前瞻账本（--demo 写入独立演示账本，绝不计入前瞻验证）
 python -m piia agent-run --starting-cash 500
 python -m piia agent-status
 
 # 3. 人工审批或驳回待决纸面提案（仅记录本地纸面账本，绝不触发交易所下单）
 python -m piia agent-approve --proposal-id <PROPOSAL_ID> --choice approve --actor investor --note "manual-check"
 
-# 4. 复现无前视样本外检验与 9 组基线/模块消融对照实验（离线合成检验用 --demo-synthetic，拉取公开行情用 --fetch-public）
+# 4. 复现无前视检验与 13 组基线/正交单开关归因对照（本地缓存回放用默认目录，拉取当前公开窗口用 --fetch-public，合成工程检查用 --demo-synthetic）
 python -m experiments.run_piia_v2_oos_ablation --demo-synthetic
 
 # 5. 日常交易辅助命令：盘面扫描 / 下单前风控工单 / 持仓移动止损顾问

@@ -49,6 +49,9 @@ from trading_lab.indicators_v2 import (
 ROOT = Path(__file__).resolve().parents[4]
 CONFIG_PATH = ROOT / "config" / "piia_agent_v2.yaml"
 SYMBOLS = ("BTCUSDT", "XAUUSDT", "NDX100USDT")
+DEFAULT_FUNDING_INTERVAL_HOURS = {"BTCUSDT": 8, "NDX100USDT": 8, "XAUUSDT": 4}
+BITGET_HISTORY_FUND_URL = "https://api.bitget.com/api/v2/mix/market/history-fund-rate"
+BITGET_CURRENT_FUND_URL = "https://api.bitget.com/api/v2/mix/market/current-fund-rate"
 
 
 def load_v2_config(path: Path | None = None) -> dict[str, Any]:
@@ -395,6 +398,141 @@ def build_bar_evidence_for_symbol(
     return bundle
 
 
+def fetch_public_settled_funding_recent(
+    symbols: tuple[str, ...] = SYMBOLS,
+    *,
+    timeout: float = 12.0,
+) -> dict[str, Any]:
+    """Fetch and validate recent public Bitget settled funding history per symbol (never invent rates)."""
+    import httpx
+
+    retrieved_at = datetime.now(timezone.utc)
+    instruments: dict[str, Any] = {}
+    all_ok = True
+
+    with httpx.Client(timeout=timeout, follow_redirects=False) as client:
+        for sym in symbols:
+            default_iv = int(DEFAULT_FUNDING_INTERVAL_HOURS.get(sym, 8))
+            interval_hours: int | None = None
+            interval_verified = False
+            try:
+                cur_resp = client.get(
+                    BITGET_CURRENT_FUND_URL,
+                    params={"productType": "USDT-FUTURES", "symbol": sym},
+                )
+                cur_resp.raise_for_status()
+                cur_payload = cur_resp.json()
+                if cur_payload.get("code") == "00000":
+                    cdata = cur_payload.get("data")
+                    crow = cdata[0] if isinstance(cdata, list) and cdata else (cdata if isinstance(cdata, dict) else {})
+                    raw_iv = crow.get("fundingRateInterval") if isinstance(crow, dict) else None
+                    if raw_iv is not None and not isinstance(raw_iv, bool) and str(raw_iv).isdigit():
+                        parsed_iv = int(raw_iv)
+                        if parsed_iv > 0 and 24 % parsed_iv == 0:
+                            interval_hours = parsed_iv
+                            interval_verified = True
+            except Exception:
+                pass
+
+            eff_iv = interval_hours if interval_hours is not None else default_iv
+            source_url = (
+                f"{BITGET_HISTORY_FUND_URL}?productType=USDT-FUTURES&symbol={sym}&pageSize=100&pageNo=1"
+            )
+            try:
+                resp = client.get(
+                    BITGET_HISTORY_FUND_URL,
+                    params={
+                        "productType": "USDT-FUTURES",
+                        "symbol": sym,
+                        "pageSize": "100",
+                        "pageNo": "1",
+                    },
+                )
+                resp.raise_for_status()
+                raw_bytes = resp.content
+                raw_sha = hashlib.sha256(raw_bytes).hexdigest()
+                payload = resp.json()
+                if payload.get("code") != "00000" or not isinstance(payload.get("data"), list):
+                    raise ValueError("invalid_history_response")
+                req_time_raw = payload.get("requestTime")
+                if isinstance(req_time_raw, bool) or not str(req_time_raw).isdigit():
+                    raise ValueError("invalid_request_time")
+                server_ms = int(req_time_raw)
+                parsed_rows: list[dict[str, Any]] = []
+                prev_ms: int | None = None
+                for row in payload["data"]:
+                    if not isinstance(row, dict) or row.get("symbol") != sym:
+                        raise ValueError("funding_symbol_mismatch")
+                    ft_raw = row.get("fundingTime")
+                    fr_raw = row.get("fundingRate")
+                    if isinstance(ft_raw, bool) or not str(ft_raw).isdigit():
+                        raise ValueError("invalid_funding_time")
+                    if isinstance(fr_raw, bool) or fr_raw is None:
+                        raise ValueError("invalid_funding_rate")
+                    ts_ms = int(ft_raw)
+                    rate = float(fr_raw)
+                    if ts_ms <= 0 or ts_ms > server_ms or ts_ms % 3_600_000 != 0:
+                        raise ValueError("non_hour_aligned_or_future_funding")
+                    if not math.isfinite(rate) or abs(rate) > 1.0:
+                        raise ValueError("funding_rate_out_of_bounds")
+                    if prev_ms is not None and ts_ms >= prev_ms:
+                        raise ValueError("funding_history_not_strictly_descending")
+                    prev_ms = ts_ms
+                    parsed_rows.append(
+                        {
+                            "timestamp": ts_ms,
+                            "settlement_utc": datetime.fromtimestamp(ts_ms / 1000.0, timezone.utc).isoformat(),
+                            "rate": rate,
+                        }
+                    )
+                if not parsed_rows:
+                    raise ValueError("empty_funding_history")
+                parsed_rows.reverse()  # oldest first
+                contiguous = all(
+                    (b["timestamp"] - a["timestamp"]) == eff_iv * 3_600_000
+                    for a, b in zip(parsed_rows, parsed_rows[1:])
+                )
+                grid_aligned = all(((r["timestamp"] // 3_600_000) % eff_iv) == 0 for r in parsed_rows)
+                schedule_verified = bool(interval_verified and contiguous and grid_aligned)
+                instruments[sym] = {
+                    "ok": True,
+                    "symbol": sym,
+                    "source_url": source_url,
+                    "raw_sha256": raw_sha,
+                    "retrieved_at_utc": retrieved_at.isoformat(),
+                    "server_at_utc": datetime.fromtimestamp(server_ms / 1000.0, timezone.utc).isoformat(),
+                    "interval_hours": eff_iv,
+                    "interval_verified": interval_verified,
+                    "schedule_verified": schedule_verified,
+                    "records": parsed_rows,
+                    "limitations": (
+                        "Bitget public history-fund-rate pageNo=1 only; public settled rate proxy, "
+                        "not an authenticated account funding statement."
+                    ),
+                }
+            except Exception as exc:
+                all_ok = False
+                instruments[sym] = {
+                    "ok": False,
+                    "symbol": sym,
+                    "source_url": source_url,
+                    "raw_sha256": None,
+                    "retrieved_at_utc": retrieved_at.isoformat(),
+                    "server_at_utc": None,
+                    "interval_hours": eff_iv,
+                    "interval_verified": interval_verified,
+                    "schedule_verified": False,
+                    "error": f"{type(exc).__name__}:{exc}",
+                    "records": [],
+                }
+
+    return {
+        "ok": all_ok,
+        "retrieved_at_utc": retrieved_at.isoformat(),
+        "instruments": instruments,
+    }
+
+
 def collect_live_six_pillar_snapshot(
     symbols: tuple[str, ...] = SYMBOLS,
     *,
@@ -540,11 +678,14 @@ def collect_live_six_pillar_snapshot(
     except Exception as exc:
         chronos_payload = {"weights_ran": False, "reason": type(exc).__name__, "forecasts": {}}
 
+    settled_funding = fetch_public_settled_funding_recent(symbols)
+
     return {
         "collected_at_utc": datetime.now(timezone.utc).isoformat(),
         "market_snapshot": market_snap,
         "books_snapshot": books_snap,
         "tiers_snapshot": tiers_snap,
+        "settled_funding": settled_funding,
         "macro_context": macro_ctx,
         "event_calendar_context": calendar_ctx,
         "flows_positioning_context": flows_positioning_ctx,

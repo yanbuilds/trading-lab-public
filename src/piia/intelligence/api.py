@@ -455,13 +455,15 @@ class AgentProposalDecisionIn(BaseModel):
     choice: str
     actor: str = "local-investor"
     note: str = ""
+    demo_mode: bool = False
 
 
-def _resolve_v2_ledger_path() -> Path:
+def _resolve_v2_ledger_path(demo: bool = False) -> Path:
+    """Live and demo ledgers are always separate; env overrides are also per evidence kind."""
     import os
-    from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH
-    override = os.environ.get("PIIA_V2_LEDGER_PATH")
-    return Path(override) if override else DEFAULT_LEDGER_PATH
+    from piia.intelligence.agent_v2.continuous_paper import default_ledger_path
+    override = os.environ.get("PIIA_V2_DEMO_LEDGER_PATH" if demo else "PIIA_V2_LEDGER_PATH")
+    return Path(override) if override else default_ledger_path(demo=demo)
 
 
 @app.get("/agent-v2/verify-freeze")
@@ -471,9 +473,9 @@ def agent_v2_verify_freeze():
 
 
 @app.get("/agent-v2/status")
-def agent_v2_status():
+def agent_v2_status(demo: bool = False):
     from piia.intelligence.agent_v2.continuous_paper import get_continuous_paper_status
-    return get_continuous_paper_status(_resolve_v2_ledger_path())
+    return get_continuous_paper_status(_resolve_v2_ledger_path(demo), demo=demo)
 
 
 @app.post("/agent-v2/run-cycle")
@@ -481,7 +483,7 @@ def agent_v2_run_cycle(payload: AgentCycleIn):
     from piia.intelligence.agent_v2.continuous_paper import run_prospective_cycle
     try:
         return run_prospective_cycle(
-            db_path=_resolve_v2_ledger_path(),
+            db_path=_resolve_v2_ledger_path(payload.demo_mode),
             starting_cash=payload.starting_cash,
             demo_mode=payload.demo_mode,
         )
@@ -498,7 +500,7 @@ def agent_v2_decide_proposal(proposal_id: str, payload: AgentProposalDecisionIn)
             choice=payload.choice,
             actor=payload.actor,
             note=payload.note,
-            db_path=_resolve_v2_ledger_path(),
+            db_path=_resolve_v2_ledger_path(payload.demo_mode),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

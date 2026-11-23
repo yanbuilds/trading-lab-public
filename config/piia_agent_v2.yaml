@@ -1,14 +1,24 @@
-# Pre-registered Personal Investment Intelligence Agent (PIIA v2) Frozen Policy.
-# Locked BEFORE fetching or evaluating post-2026-11-16 out-of-sample market data.
-# Any change to decision thresholds, cost assumptions, or risk gates requires a new version (v3).
+# Personal Investment Intelligence Agent (PIIA v2.2.1) Frozen Policy.
+# Retains ALL strategy, cost, and risk thresholds from v2.0.0 unchanged (zero tuning for PnL).
+# v2.2.1: ledger evidence-kind isolation, three-contract closed-bar alignment gate,
+# contiguous-hour prospective counting, pre-freeze live write rejection before SQLite I/O,
+# and read-only invalidation of pre-freeze-contaminated live ledgers.
 
 protocol_id: PIIA_PERSONAL_INVESTMENT_INTELLIGENCE_AGENT_V2
-version: "2.0.0"
-precommitted_before_post_2026_11_16_holdout: true
+version: "2.2.1"
+base_commit_reviewed: "7d46223d33d0d8d2aaba952e064cacdb2ab4ec52"
+precommitted_before_post_2026_11_16_holdout: false
+prospective_freeze_started_utc: "2026-11-23T09:00:00+00:00"
 tuning_on_holdout_forbidden: true
 retain_negative_and_null_results: true
 live_order_permissions: false
 exchange_demo_order_permissions: false
+
+evaluation_rules:
+  # Only live observations recorded by the current frozen manifest, at or after the freeze start,
+  # captured within their own cutoff hour, are counted. Sufficiency requires one unbroken run.
+  prospective_min_contiguous_hours: 168
+  sufficient_sample_status: PENDING_AUDIT_CONTIGUOUS_WINDOW_REACHED
 
 universe:
   venue: bitget
