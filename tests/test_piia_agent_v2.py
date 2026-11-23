@@ -232,9 +232,11 @@ def test_agent_v2_cli_fastapi_and_synthetic_runner(tmp_path, monkeypatch):
             "--actor", "cli-tester", "--note", "manual-pass", "--db", str(cli_db),
         ]) == 0
 
-    # 2. FastAPI `/agent-v2/*` routes isolated via PIIA_V2_LEDGER_PATH
-    api_db = tmp_path / "api_v2.sqlite"
-    monkeypatch.setenv("PIIA_V2_LEDGER_PATH", str(api_db))
+    # 2. FastAPI `/agent-v2/*` routes: demo and live ledgers resolved separately
+    api_db = tmp_path / "api_v2_demo.sqlite"
+    api_live_db = tmp_path / "api_v2_live.sqlite"
+    monkeypatch.setenv("PIIA_V2_DEMO_LEDGER_PATH", str(api_db))
+    monkeypatch.setenv("PIIA_V2_LEDGER_PATH", str(api_live_db))
     with TestClient(app) as client:
         r_fz = client.get("/agent-v2/verify-freeze")
         assert r_fz.status_code == 200 and r_fz.json()["ok"] is True
@@ -242,16 +244,22 @@ def test_agent_v2_cli_fastapi_and_synthetic_runner(tmp_path, monkeypatch):
         r_run = client.post("/agent-v2/run-cycle", json={"demo_mode": True, "starting_cash": 500.0})
         assert r_run.status_code == 200
         assert r_run.json()["order_permissions"] is False
+        assert api_db.is_file() and not api_live_db.exists()
 
-        r_st = client.get("/agent-v2/status")
+        r_live_st = client.get("/agent-v2/status")
+        assert r_live_st.status_code == 200
+        assert r_live_st.json()["initialized"] is False
+
+        r_st = client.get("/agent-v2/status?demo=true")
         assert r_st.status_code == 200
         st_json = r_st.json()
         assert st_json["initialized"] is True
+        assert st_json["prospective_validation"]["counted_observations"] == 0
         if st_json["pending_human_proposals"]:
             api_pid = st_json["pending_human_proposals"][0]["proposal_id"]
             r_dec = client.post(
                 f"/agent-v2/proposals/{api_pid}/decision",
-                json={"choice": "approve", "actor": "api-tester", "note": "approved-in-test"},
+                json={"choice": "approve", "actor": "api-tester", "note": "approved-in-test", "demo_mode": True},
             )
             assert r_dec.status_code == 200
             assert r_dec.json()["live_orders_submitted"] is False

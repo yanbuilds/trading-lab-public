@@ -1,6 +1,8 @@
 """Append-Only Continuous Prospective Paper Trading Engine (PIIA v2.1).
 
-Maintains an immutable local SQLite audit ledger (`data/piia/piia_v2_1_continuous.sqlite`)
+Maintains immutable local SQLite audit ledgers, strictly separated by evidence kind:
+`data/piia/piia_v2_2_live_prospective.sqlite` (live public collection only) and
+`data/piia/piia_v2_2_demo_synthetic.sqlite` (synthetic demo only),
 with SQLite triggers forbidding `UPDATE` and `DELETE` on `cycles`, `decision_traces`,
 `ledger_events`, `human_proposals`, `human_decisions`, and `position_settlements`.
 
@@ -46,8 +48,47 @@ from piia.intelligence.agent_v2.risk_gate import (
 from trading_lab.perps.risk import exit_pnl, stop_fill
 from trading_lab.perps.risk_v2 import resolve_spec
 
-DEFAULT_LEDGER_PATH = ROOT / "data" / "piia" / "piia_v2_1_continuous.sqlite"
+# Strictly separated ledgers: live prospective evidence must never share a file with
+# synthetic demo cycles or caller-injected snapshots (v2.2 isolation fix).
+REAL_LEDGER_PATH = ROOT / "data" / "piia" / "piia_v2_2_live_prospective.sqlite"
+DEMO_LEDGER_PATH = ROOT / "data" / "piia" / "piia_v2_2_demo_synthetic.sqlite"
+DEFAULT_LEDGER_PATH = REAL_LEDGER_PATH
+# Earlier ledgers are preserved untouched and never written or counted by v2.2.
+LEGACY_LEDGER_PATHS = (
+    ROOT / "data" / "piia" / "piia_v2_continuous.sqlite",
+    ROOT / "data" / "piia" / "piia_v2_1_continuous.sqlite",
+)
 APP_ID = 0x50495632  # "PIV2"
+LEDGER_SCHEMA_VERSION = "piia_v2_2_ledger_1"
+
+MODE_LIVE = "live_prospective_public_6_pillars"
+MODE_DEMO = "SYNTHETIC_DEMO_NOT_LIVE"
+MODE_INJECTED = "caller_injected_snapshot"
+KIND_LIVE = "live_prospective"
+KIND_DEMO = "demo_synthetic"
+KIND_INJECTED = "test_or_injected"
+MODE_TO_KIND = {MODE_LIVE: KIND_LIVE, MODE_DEMO: KIND_DEMO, MODE_INJECTED: KIND_INJECTED}
+
+
+class LedgerKindError(ValueError):
+    """Raised when a write would mix live, demo, or injected evidence in one ledger."""
+
+
+def _utc_now() -> datetime:
+    """Single clock source (tests monkeypatch this; production uses the system UTC clock)."""
+    return datetime.now(timezone.utc)
+
+
+def default_ledger_path(demo: bool = False) -> Path:
+    """Resolve the default ledger for a mode (read at call time so tests can redirect)."""
+    return Path(DEMO_LEDGER_PATH if demo else REAL_LEDGER_PATH)
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
 SHADOW_BASE_ARMS = (
     "B0_cash",
     "B1_simple_ema_1h",
@@ -75,8 +116,13 @@ def _ts_utc(value: str | pd.Timestamp | datetime) -> pd.Timestamp:
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
-def _init_db(db_path: Path) -> sqlite3.Connection:
+def _init_db(db_path: Path, *, ledger_kind: str | None = None) -> sqlite3.Connection:
+    """Open (or create) a ledger. Unlabelled legacy ledgers are refused for any write path."""
     db_path = Path(db_path)
+    if ledger_kind is not None and ledger_kind not in MODE_TO_KIND.values():
+        raise LedgerKindError(f"Unknown ledger kind {ledger_kind!r}")
+    if ledger_kind is not None and ledger_kind != KIND_LIVE and _same_file(db_path, REAL_LEDGER_PATH):
+        raise LedgerKindError("Demo or injected records can never be written to the real prospective ledger path.")
     db_path.parent.mkdir(parents=True, exist_ok=True)
     existed = db_path.exists() and db_path.stat().st_size > 0
     conn = sqlite3.connect(db_path)
@@ -85,6 +131,13 @@ def _init_db(db_path: Path) -> sqlite3.Connection:
     if existed and app not in (0, APP_ID):
         conn.close()
         raise ValueError(f"Unrelated SQLite database at {_display_path(db_path)}")
+    had_tables = bool(_sqlite_tables(conn))
+    if had_tables and "ledger_meta" not in _sqlite_tables(conn):
+        conn.close()
+        raise LedgerKindError(
+            f"Legacy unlabelled ledger at {_display_path(db_path)} (pre-v2.2, may mix demo and live cycles); "
+            "it is preserved read-only and cannot be written. Use `python -m piia agent-inspect-ledger`."
+        )
     if not existed or app == 0:
         conn.execute(f"PRAGMA application_id={APP_ID}")
 
@@ -97,7 +150,9 @@ def _init_db(db_path: Path) -> sqlite3.Connection:
             manifest_sha256 TEXT NOT NULL,
             mode TEXT NOT NULL,
             pillars_summary_json TEXT NOT NULL,
-            cycle_hash TEXT NOT NULL
+            cycle_hash TEXT NOT NULL,
+            capture_started_utc TEXT,
+            policy_version TEXT
         );
 
         CREATE TABLE IF NOT EXISTS decision_traces (
@@ -179,9 +234,52 @@ def _init_db(db_path: Path) -> sqlite3.Connection:
         BEGIN SELECT RAISE(ABORT, 'append-only human_decisions'); END;
         CREATE TRIGGER IF NOT EXISTS immutable_decisions_del BEFORE DELETE ON human_decisions
         BEGIN SELECT RAISE(ABORT, 'append-only human_decisions'); END;
+
+        CREATE TABLE IF NOT EXISTS ledger_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TRIGGER IF NOT EXISTS immutable_meta_upd BEFORE UPDATE ON ledger_meta
+        BEGIN SELECT RAISE(ABORT, 'append-only ledger_meta'); END;
+        CREATE TRIGGER IF NOT EXISTS immutable_meta_del BEFORE DELETE ON ledger_meta
+        BEGIN SELECT RAISE(ABORT, 'append-only ledger_meta'); END;
         """
     )
+    if not had_tables:
+        kind = ledger_kind or KIND_INJECTED
+        conn.executemany(
+            "INSERT INTO ledger_meta(key, value) VALUES (?, ?)",
+            [
+                ("ledger_kind", kind),
+                ("schema_version", LEDGER_SCHEMA_VERSION),
+                ("created_at_utc", _utc_now().isoformat()),
+            ],
+        )
+        conn.commit()
     return conn
+
+
+def _sqlite_tables(conn: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
+
+
+def _read_ledger_kind(conn: sqlite3.Connection) -> str | None:
+    if "ledger_meta" not in _sqlite_tables(conn):
+        return None
+    row = conn.execute("SELECT value FROM ledger_meta WHERE key = 'ledger_kind'").fetchone()
+    return str(row[0]) if row else None
+
+
+def _assert_ledger_accepts(db_path: Path, conn: sqlite3.Connection, required_kind: str) -> None:
+    """Fail closed unless the opened ledger is labelled with exactly the required evidence kind."""
+    actual = _read_ledger_kind(conn)
+    if actual != required_kind:
+        raise LedgerKindError(
+            f"Ledger {_display_path(db_path)} is labelled {actual!r}; refusing to write {required_kind!r} records "
+            "(live, demo, and injected evidence must use separate ledgers)."
+        )
+    if required_kind != KIND_LIVE and _same_file(db_path, REAL_LEDGER_PATH):
+        raise LedgerKindError("Demo or injected records can never be written to the real prospective ledger path.")
 
 
 def _candles_to_df(candles: list[dict[str, Any]]) -> pd.DataFrame:
@@ -886,27 +984,97 @@ def _reconcile_open_position_with_bars(
     return state
 
 
+def check_three_contract_alignment(
+    mkt_snap: dict[str, Any],
+    *,
+    expected_cutoff: pd.Timestamp,
+) -> dict[str, Any]:
+    """Require BTCUSDT / XAUUSDT / NDX100USDT to share the same latest closed 1h bar == expected cutoff.
+
+    `expected_cutoff` is the close time of the most recent fully closed hour at capture time.
+    Any missing, gapped, lagging (stale) or future bar rejects the whole cycle.
+    """
+    reasons: list[str] = []
+    frames: dict[str, pd.DataFrame] = {}
+    last_close_by_symbol: dict[str, str | None] = {}
+    one_h = pd.Timedelta(hours=1)
+    for sym in SYMBOLS:
+        inst = (mkt_snap.get("instruments") or {}).get(sym) or {}
+        candles = inst.get("candles_closed_1h") or []
+        if not candles:
+            reasons.append(f"missing_candles:{sym}")
+            last_close_by_symbol[sym] = None
+            continue
+        try:
+            df = _candles_to_df(candles)
+        except (KeyError, TypeError, ValueError):
+            reasons.append(f"invalid_candles:{sym}")
+            last_close_by_symbol[sym] = None
+            continue
+        if df.index.has_duplicates:
+            reasons.append(f"duplicate_candles:{sym}")
+        diffs = df.index.to_series().diff().dropna()
+        if not diffs.empty and bool((diffs != one_h).any()):
+            reasons.append(f"gapped_candles:{sym}")
+        last_close = df.index[-1] + one_h
+        last_close_by_symbol[sym] = last_close.isoformat()
+        if last_close > expected_cutoff:
+            reasons.append(f"future_candle:{sym}:last_close={last_close.isoformat()}>expected={expected_cutoff.isoformat()}")
+        elif last_close < expected_cutoff:
+            reasons.append(f"stale_or_lagging_candle:{sym}:last_close={last_close.isoformat()}<expected={expected_cutoff.isoformat()}")
+        frames[sym] = df
+    if len({v for v in last_close_by_symbol.values() if v is not None}) > 1:
+        reasons.append("misaligned_latest_close_across_contracts")
+    ok = not reasons and len(frames) == len(SYMBOLS)
+    return {
+        "ok": ok,
+        "reasons": reasons,
+        "expected_cutoff_utc": expected_cutoff.isoformat(),
+        "last_close_by_symbol": last_close_by_symbol,
+        "frames": frames if ok else {},
+    }
+
+
 def run_prospective_cycle(
     *,
-    db_path: Path = DEFAULT_LEDGER_PATH,
+    db_path: Path | None = None,
     starting_cash: float = 500.0,
     demo_mode: bool = False,
     snapshot_override: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Execute one prospective PIIA v2.1 cycle: verify freeze -> collect 6 pillars -> reconcile -> trace -> append."""
+    """Execute one prospective PIIA cycle: verify freeze -> collect -> align -> reconcile -> trace -> append.
+
+    Evidence kinds are isolated: live public collection may only write to a `live_prospective`
+    ledger; demo cycles only to a `demo_synthetic` ledger; caller-injected snapshots only to an
+    explicitly supplied `test_or_injected` ledger (never the real ledger path).
+    """
     from piia.intelligence.agent_v2.manifest import verify_piia_v2_frozen
 
     manifest_check = verify_piia_v2_frozen()
     if not manifest_check["ok"]:
         raise ValueError(f"Frozen PIIA v2 manifest verification failed: {manifest_check['issues']}")
 
+    if snapshot_override is not None:
+        mode = MODE_INJECTED  # never trust a caller-provided "mode" label
+    elif demo_mode:
+        mode = MODE_DEMO
+    else:
+        mode = MODE_LIVE
+    required_kind = MODE_TO_KIND[mode]
+    if db_path is None:
+        if mode == MODE_INJECTED:
+            raise LedgerKindError("Caller-injected snapshots require an explicit, non-live db_path.")
+        db_path = default_ledger_path(demo=(mode == MODE_DEMO))
+    db_path = Path(db_path)
+    if mode != MODE_LIVE and _same_file(db_path, REAL_LEDGER_PATH):
+        raise LedgerKindError("Demo or injected records can never be written to the real prospective ledger path.")
+
     cfg = load_v2_config()
-    now = datetime.now(timezone.utc)
+    now = _utc_now()
     now_iso = now.isoformat()
 
     if snapshot_override is not None:
         collected = snapshot_override
-        mode = str(snapshot_override.get("mode") or "supplied_snapshot")
     elif demo_mode:
         from piia.intelligence.trade_assistant import generate_demo_snapshot
 
@@ -939,32 +1107,57 @@ def run_prospective_cycle(
             "polymarket_context": {"status": "demo_unavailable", "historical_replay_supported": False},
             "chronos_forecast": {"weights_ran": False, "forecasts": {}},
         }
-        mode = "SYNTHETIC_DEMO_NOT_LIVE"
     else:
         cycle_art_dir = ROOT / "artifacts" / "piia_v2_cycles" / now.strftime("%Y%m%dT%H%M%SZ")
         collected = collect_live_six_pillar_snapshot(SYMBOLS, snapshot_dir=cycle_art_dir)
-        mode = "live_prospective_public_6_pillars"
+
+    # ---- Three-contract closed-bar alignment gate (no ledger I/O before this passes) ----
+    one_h = pd.Timedelta(hours=1)
+    pre_reasons: list[str] = []
+    if mode == MODE_INJECTED:
+        raw_ref = collected.get("collected_at_utc")
+        if not raw_ref:
+            pre_reasons.append("injected_snapshot_missing_collected_at_utc")
+            expected_cutoff = _ts_utc(now).floor("h")
+        else:
+            expected_cutoff = _ts_utc(raw_ref).floor("h")
+    else:
+        expected_cutoff = _ts_utc(now).floor("h")
+        raw_done = collected.get("collected_at_utc")
+        if raw_done and _ts_utc(raw_done).floor("h") != expected_cutoff:
+            pre_reasons.append("collection_crossed_hour_boundary")
+
+    align = check_three_contract_alignment(collected["market_snapshot"], expected_cutoff=expected_cutoff)
+    reasons = pre_reasons + list(align["reasons"])
+    if reasons:
+        return {
+            "status": "rejected_input_alignment",
+            "reasons": reasons,
+            "expected_cutoff_utc": expected_cutoff.isoformat(),
+            "last_close_by_symbol": align["last_close_by_symbol"],
+            "mode": mode,
+            "db_path": _display_path(db_path),
+            "ledger_written": False,
+            "live_orders_submitted": False,
+            "order_permissions": False,
+        }
 
     mkt_snap = collected["market_snapshot"]
+    cutoff_hour = expected_cutoff
+    signal_bar_open = cutoff_hour - one_h  # explicit common signal bar (closes exactly at cutoff)
+    prev_bar_open = cutoff_hour - 2 * one_h
     prepared_tables: dict[str, pd.DataFrame] = {}
-    latest_closes: list[pd.Timestamp] = []
     for sym in SYMBOLS:
-        inst = (mkt_snap.get("instruments") or {}).get(sym) or {}
-        df = _candles_to_df(inst.get("candles_closed_1h") or [])
-        if not df.empty:
-            prepared_tables[sym] = prepare_market_feature_table(df, cfg=cfg)
-            latest_closes.append(df.index[-1] + pd.Timedelta(hours=1))
+        df_aligned = align["frames"][sym].loc[lambda d: d.index <= signal_bar_open]
+        prepared_tables[sym] = prepare_market_feature_table(df_aligned, cfg=cfg)
 
-    if len(prepared_tables) != len(SYMBOLS):
-        raise ValueError("Incomplete closed 1h candle series across BTCUSDT/XAUUSDT/NDX100USDT")
-
-    cutoff_hour = min(latest_closes)
     cutoff_iso = cutoff_hour.isoformat()
     settled_funding_ctx = collected.get("settled_funding")
     base_slip = float(cfg["risk_and_costs"]["slippage_each_side_base"])
 
-    conn = _init_db(db_path)
+    conn = _init_db(db_path, ledger_kind=required_kind)
     try:
+        _assert_ledger_accepts(db_path, conn, required_kind)
         existing_cycle = conn.execute(
             "SELECT cycle_id FROM cycles WHERE cutoff_hour_utc = ?", (cutoff_iso,)
         ).fetchone()
@@ -1024,8 +1217,8 @@ def run_prospective_cycle(
 
         for sym in SYMBOLS:
             df_sym = prepared_tables[sym]
-            sig_row = df_sym.iloc[-1]
-            prev_c = float(df_sym.iloc[-2]["close"]) if len(df_sym) >= 2 else None
+            sig_row = df_sym.loc[signal_bar_open]
+            prev_c = float(df_sym.loc[prev_bar_open]["close"]) if prev_bar_open in df_sym.index else None
             inst_snap = (mkt_snap.get("instruments") or {}).get(sym) or {}
             f_obj = inst_snap.get("funding") or {}
             f_rate = None
@@ -1214,14 +1407,16 @@ def run_prospective_cycle(
             slip_b = base_slip * mult
             for sym in SYMBOLS:
                 df_sym = prepared_tables[sym]
-                if len(df_sym) < 2:
+                if signal_bar_open not in df_sym.index or prev_bar_open not in df_sym.index:
                     continue
-                cand = _baseline_candidate_from_row(base_arm, sym, df_sym.iloc[-1], df_sym.iloc[-2])
+                row_sig = df_sym.loc[signal_bar_open]
+                row_prev = df_sym.loc[prev_bar_open]
+                cand = _baseline_candidate_from_row(base_arm, sym, row_sig, row_prev)
                 if cand.get("candidate_direction") not in {"long", "short"}:
                     continue
                 mkt_pil = {
-                    "ohlc": {"close": float(df_sym.iloc[-1]["close"])},
-                    "atr14": float(df_sym.iloc[-1]["atr14"]) if pd.notna(df_sym.iloc[-1]["atr14"]) else 0.0,
+                    "ohlc": {"close": float(row_sig["close"])},
+                    "atr14": float(row_sig["atr14"]) if pd.notna(row_sig["atr14"]) else 0.0,
                     "funding_rate_8h": None,
                 }
                 rg_b = evaluate_programmatic_risk(
@@ -1280,27 +1475,45 @@ def run_prospective_cycle(
             "books_ok": bool((collected.get("books_snapshot") or {}).get("ok")),
             "tiers_ok": bool((collected.get("tiers_snapshot") or {}).get("ok")),
         }
+        recorded_at = _utc_now()
+        if mode != MODE_INJECTED and recorded_at >= (cutoff_hour + one_h).to_pydatetime():
+            conn.rollback()
+            return {
+                "status": "rejected_input_alignment",
+                "reasons": ["capture_completed_after_cutoff_hour"],
+                "expected_cutoff_utc": cutoff_iso,
+                "mode": mode,
+                "db_path": _display_path(db_path),
+                "ledger_written": False,
+                "live_orders_submitted": False,
+                "order_permissions": False,
+            }
+        recorded_iso = recorded_at.isoformat()
         cycle_doc = {
             "cycle_id": cycle_id,
             "cutoff_hour_utc": cutoff_iso,
-            "recorded_at_utc": now_iso,
+            "capture_started_utc": now_iso,
+            "recorded_at_utc": recorded_iso,
             "manifest_sha256": manifest_check["manifest_sha256"],
+            "policy_version": cfg["version"],
             "mode": mode,
             "pillars_summary": pillars_summary,
             "decision_hashes": {s: tr["trace_hash"] for s, tr in traces_by_symbol.items()},
         }
         c_hash = canonical_sha256(cycle_doc)
         conn.execute(
-            "INSERT INTO cycles(cycle_id, cutoff_hour_utc, recorded_at_utc, manifest_sha256, mode, pillars_summary_json, cycle_hash) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO cycles(cycle_id, cutoff_hour_utc, recorded_at_utc, manifest_sha256, mode, pillars_summary_json, "
+            "cycle_hash, capture_started_utc, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 cycle_id,
                 cutoff_iso,
-                now_iso,
+                recorded_iso,
                 manifest_check["manifest_sha256"],
                 mode,
                 json.dumps(pillars_summary, sort_keys=True),
                 c_hash,
+                now_iso,
+                cfg["version"],
             ),
         )
         conn.commit()
@@ -1373,7 +1586,7 @@ def approve_human_proposal(
     choice: str,
     actor: str = "local-investor",
     note: str = "",
-    db_path: Path = DEFAULT_LEDGER_PATH,
+    db_path: Path | None = None,
     current_quote: dict[str, Any] | None = None,
     prepared_tables: dict[str, pd.DataFrame] | None = None,
     settled_funding: dict[str, Any] | None = None,
@@ -1384,8 +1597,23 @@ def approve_human_proposal(
     if choice not in {"approve", "reject"}:
         raise ValueError("choice must be 'approve' or 'reject'")
     cfg = load_v2_config()
+    db_path = Path(db_path) if db_path is not None else default_ledger_path(demo=False)
+    if not db_path.is_file():
+        raise ValueError(f"Ledger not found: {_display_path(db_path)}")
     conn = _init_db(db_path)
     try:
+        ledger_kind = _read_ledger_kind(conn)
+        if ledger_kind == KIND_LIVE and (
+            current_quote is not None
+            or prepared_tables is not None
+            or settled_funding is not None
+            or now_override is not None
+            or fetch_live_quote is False
+        ):
+            raise LedgerKindError(
+                "Caller-injected quotes, bars, funding, or clocks are refused on the live prospective ledger; "
+                "approval there must revalidate against freshly fetched public data."
+            )
         prop_row = conn.execute("SELECT * FROM human_proposals WHERE proposal_id = ?", (proposal_id,)).fetchone()
         if not prop_row:
             raise ValueError(f"Proposal not found: {proposal_id}")
@@ -1393,7 +1621,7 @@ def approve_human_proposal(
         if existing:
             raise ValueError(f"Proposal {proposal_id} was already decided ({existing['choice']})")
 
-        now = (now_override or datetime.now(timezone.utc)).astimezone(timezone.utc)
+        now = (now_override or _utc_now()).astimezone(timezone.utc)
         now_iso = now.isoformat()
         prop = json.loads(prop_row["proposal_json"])
 
@@ -1605,60 +1833,279 @@ def approve_human_proposal(
         conn.close()
 
 
-def get_continuous_paper_status(db_path: Path = DEFAULT_LEDGER_PATH) -> dict[str, Any]:
-    """Read-only summary of recorded prospective cycles, latest traces, halts, funding completeness, and reconciliation."""
+def _open_readonly(db_path: Path) -> sqlite3.Connection:
+    conn = sqlite3.connect(f"{Path(db_path).resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _mode_kind(mode: str | None) -> str:
+    if mode == MODE_LIVE:
+        return KIND_LIVE
+    if mode == MODE_DEMO:
+        return KIND_DEMO
+    return KIND_INJECTED
+
+
+def inspect_ledger(db_path: Path) -> dict[str, Any]:
+    """Read-only compatibility audit of a PIIA v2 ledger file. Never modifies the file."""
     db_path = Path(db_path)
+    out: dict[str, Any] = {"db_path": _display_path(db_path), "exists": db_path.is_file()}
+    if not out["exists"]:
+        out.update({"classification": "absent", "usable_as_live_prospective_ledger": False, "notes": []})
+        return out
+    conn = _open_readonly(db_path)
+    try:
+        tables = _sqlite_tables(conn)
+        kind = _read_ledger_kind(conn)
+        modes: dict[str, int] = {}
+        manifests: dict[str, int] = {}
+        if "cycles" in tables:
+            for r in conn.execute("SELECT mode, manifest_sha256, COUNT(*) AS n FROM cycles GROUP BY mode, manifest_sha256"):
+                modes[r["mode"]] = modes.get(r["mode"], 0) + int(r["n"])
+                manifests[r["manifest_sha256"]] = manifests.get(r["manifest_sha256"], 0) + int(r["n"])
+        book_modes: dict[str, int] = {}
+        if "ledger_events" in tables:
+            for r in conn.execute("SELECT payload_json FROM ledger_events WHERE event_kind = 'init_book'"):
+                m = str(json.loads(r["payload_json"]).get("mode") or "unknown")
+                book_modes[m] = book_modes.get(m, 0) + 1
+    finally:
+        conn.close()
+
+    kinds_seen = {_mode_kind(m) for m in modes} | {_mode_kind(m) for m in book_modes if m != "unknown"}
+    if not modes and not book_modes:
+        classification = "empty"
+    elif not kinds_seen:
+        classification = "no_cycles_unlabelled_book_events"
+    elif len(kinds_seen) > 1:
+        classification = "mixed_demo_live_or_injected"
+    else:
+        classification = f"{next(iter(kinds_seen))}_only"
+    label = kind if kind is not None else "legacy_unlabeled_pre_v2_2"
+    usable = bool(
+        kind == KIND_LIVE
+        and classification in {"empty", f"{KIND_LIVE}_only"}
+        and _same_file(db_path, REAL_LEDGER_PATH)
+    )
+    notes: list[str] = []
+    if kind is None:
+        notes.append(
+            "Pre-v2.2 ledger without an evidence-kind label: preserved untouched, never written, never counted. "
+            "Its simulated cash and positions may already reflect demo or injected cycles."
+        )
+    if classification.startswith("mixed"):
+        notes.append("Mixed evidence: demo or injected cycles share simulated balances with live cycles; invalid for validation.")
+    out.update(
+        {
+            "ledger_kind_label": label,
+            "classification": classification,
+            "cycle_modes": modes,
+            "cycle_manifests": manifests,
+            "book_init_modes": book_modes,
+            "usable_as_live_prospective_ledger": usable,
+            "notes": notes,
+        }
+    )
+    return out
+
+
+def compute_prospective_validation(
+    cycle_rows: list[dict[str, Any]],
+    *,
+    ledger_kind: str | None,
+    cfg: dict[str, Any],
+    manifest_sha256: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Count only post-freeze, on-time, live observations recorded by the current frozen code."""
+    required = int(cfg["evaluation_rules"]["prospective_min_contiguous_hours"])
+    freeze_start = _ts_utc(cfg["prospective_freeze_started_utc"])
+    base = {
+        "required_contiguous_hours": required,
+        "freeze_started_utc": freeze_start.isoformat(),
+        "counted_observations": 0,
+        "longest_contiguous_hours": 0,
+        "longest_contiguous_window": None,
+        "missing_hours_within_observed_span": 0,
+        "missing_hours_since_freeze": None,
+        "excluded_cycles": {},
+    }
+    if ledger_kind != KIND_LIVE:
+        base.update(
+            {
+                "validation_status": "NOT_A_PROSPECTIVE_LEDGER",
+                "validation_note": "非真实前瞻账本（演示/注入/旧版未标注），不计入任何验证计数。",
+            }
+        )
+        return base
+
+    one_h = pd.Timedelta(hours=1)
+    excluded: dict[str, int] = {}
+    counted: set[pd.Timestamp] = set()
+
+    def _excl(reason: str) -> None:
+        excluded[reason] = excluded.get(reason, 0) + 1
+
+    for row in cycle_rows:
+        try:
+            cutoff = _ts_utc(row["cutoff_hour_utc"])
+            recorded = _ts_utc(row["recorded_at_utc"])
+            started = _ts_utc(row.get("capture_started_utc") or row["recorded_at_utc"])
+        except (KeyError, TypeError, ValueError):
+            _excl("unparseable_timestamps")
+            continue
+        if row.get("mode") != MODE_LIVE:
+            _excl("not_live_mode")
+        elif row.get("manifest_sha256") != manifest_sha256:
+            _excl("different_frozen_manifest")
+        elif row.get("policy_version") != cfg["version"]:
+            _excl("different_policy_version")
+        elif cutoff < freeze_start:
+            _excl("before_freeze_start")
+        elif cutoff != cutoff.floor("h"):
+            _excl("cutoff_not_hour_aligned")
+        elif not (cutoff <= started < cutoff + one_h and cutoff <= recorded < cutoff + one_h):
+            _excl("capture_outside_cutoff_hour")
+        elif cutoff in counted:
+            _excl("duplicate_cutoff")
+        else:
+            counted.add(cutoff)
+
+    ordered = sorted(counted)
+    best_len, best_start, best_end = 0, None, None
+    run_len, run_start = 0, None
+    prev = None
+    for ts in ordered:
+        if prev is not None and ts - prev == one_h:
+            run_len += 1
+        else:
+            run_len, run_start = 1, ts
+        if run_len > best_len:
+            best_len, best_start, best_end = run_len, run_start, ts
+        prev = ts
+
+    span_missing = 0
+    if ordered:
+        span_hours = int((ordered[-1] - ordered[0]) / one_h) + 1
+        span_missing = span_hours - len(ordered)
+    now_ts = _ts_utc(now or _utc_now())
+    latest_possible = now_ts.floor("h")
+    since_freeze_missing = None
+    if latest_possible >= freeze_start:
+        expected = int((latest_possible - freeze_start) / one_h) + 1
+        since_freeze_missing = max(0, expected - len(ordered))
+
+    sufficient = best_len >= required
+    base.update(
+        {
+            "counted_observations": len(ordered),
+            "longest_contiguous_hours": best_len,
+            "longest_contiguous_window": (
+                {"first_cutoff_utc": best_start.isoformat(), "last_cutoff_utc": best_end.isoformat()}
+                if best_start is not None
+                else None
+            ),
+            "missing_hours_within_observed_span": span_missing,
+            "missing_hours_since_freeze": since_freeze_missing,
+            "excluded_cycles": excluded,
+            "validation_status": (
+                "PENDING_AUDIT_CONTIGUOUS_WINDOW_REACHED" if sufficient else "PENDING_INSUFFICIENT_PROSPECTIVE_SAMPLE"
+            ),
+            "validation_note": (
+                f"最长连续真实观测已达 {best_len} 小时（要求 >= {required}），仅进入待审计状态，尚未构成验证结论。"
+                if sufficient
+                else f"真实前瞻观测 {len(ordered)} 小时，最长连续 {best_len} 小时（要求 >= {required} 连续小时），样本不足，待验证。"
+            ),
+        }
+    )
+    return base
+
+
+def get_continuous_paper_status(db_path: Path | None = None, *, demo: bool = False) -> dict[str, Any]:
+    """Read-only summary: ledger kind audit, prospective validation counts, books, latest traces, proposals."""
+    from piia.intelligence.agent_v2.manifest import verify_piia_v2_frozen
+
+    cfg = load_v2_config()
+    db_path = Path(db_path) if db_path is not None else default_ledger_path(demo=demo)
+    manifest_sha = verify_piia_v2_frozen()["manifest_sha256"]
+    legacy = []
+    if not demo:
+        legacy = [inspect_ledger(p) for p in LEGACY_LEDGER_PATHS if Path(p).is_file()]
+
+    audit = inspect_ledger(db_path)
     if not db_path.is_file():
+        validation = compute_prospective_validation([], ledger_kind=KIND_DEMO if demo else KIND_LIVE, cfg=cfg, manifest_sha256=manifest_sha)
         return {
             "initialized": False,
-            "cycles_recorded": 0,
-            "validation_status": "PENDING_INSUFFICIENT_PROSPECTIVE_SAMPLE",
-            "validation_note": "尚无前瞻记录，观察期未完成，数据不足以判断系统优劣。",
             "db_path": _display_path(db_path),
+            "ledger_audit": audit,
+            "legacy_ledgers": legacy,
+            "cycles_recorded": 0,
+            "prospective_validation": validation,
+            "validation_status": validation["validation_status"],
+            "validation_note": validation["validation_note"],
             "books": {},
             "latest_decisions": [],
             "pending_human_proposals": [],
             "order_permissions": False,
         }
-    conn = _init_db(db_path)
+
+    conn = _open_readonly(db_path)
     try:
-        cycles = conn.execute("SELECT * FROM cycles ORDER BY cutoff_hour_utc DESC").fetchall()
-        books_summary = {}
-        for bname in (*SHADOW_ARMS, "human_approved_paper"):
-            st = _reconstruct_book_state(conn, bname, 500.0)
-            pct = (
-                round((st["realized_net_pnl_usdt"] / st["starting_cash"]) * 100.0, 4)
-                if st["realized_net_pnl_usdt"] is not None and st["starting_cash"] > 0
-                else None
-            )
-            books_summary[bname] = {
-                "starting_cash_usdt": st["starting_cash"],
-                "cash_usdt": round(st["cash"], 4),
-                "closed_trades": len(st["closed_trades"]),
-                "realized_net_pnl_usdt": st["realized_net_pnl_usdt"],
-                "net_return_pct": pct,
-                "net_return_claim_allowed": st["net_return_claim_allowed"],
-                "realized_pnl_ex_unknown_funding_usdt": st["realized_pnl_ex_unknown_funding_usdt"],
-                "fees_paid_usdt": st["fees_paid_usdt"],
-                "known_funding_paid_usdt": st["known_funding_paid_usdt"],
-                "funding_complete": st["funding_complete"],
-                "unknown_funding_events": st["unknown_funding_events"],
-                "halted": st["halted"],
-                "halt_reason": st["halt_reason"],
-                "halted_at_utc": st["halted_at_utc"],
-                "reconciled_bar_close_utc": st["reconciled_bar_close_utc"],
-                "reconciliation_error_usdt": round(st["reconciliation_error_usdt"], 10),
-                "open_position": st["open_pos"],
-            }
+        kind = _read_ledger_kind(conn)
+        tables = _sqlite_tables(conn)
+        cycle_cols = {r[1] for r in conn.execute("PRAGMA table_info(cycles)")} if "cycles" in tables else set()
+        cycles = (
+            [dict(r) for r in conn.execute("SELECT * FROM cycles ORDER BY cutoff_hour_utc DESC")]
+            if "cycles" in tables
+            else []
+        )
+        if "capture_started_utc" not in cycle_cols:
+            for c in cycles:
+                c.setdefault("capture_started_utc", None)
+                c.setdefault("policy_version", None)
+        effective_kind = kind if not audit.get("classification", "").startswith("mixed") else None
+        validation = compute_prospective_validation(
+            cycles, ledger_kind=effective_kind, cfg=cfg, manifest_sha256=manifest_sha
+        )
+
+        books_summary: dict[str, Any] = {}
+        if "ledger_events" in tables:
+            for bname in (*SHADOW_ARMS, "human_approved_paper"):
+                st = _reconstruct_book_state(conn, bname, 500.0)
+                pct = (
+                    round((st["realized_net_pnl_usdt"] / st["starting_cash"]) * 100.0, 4)
+                    if st["realized_net_pnl_usdt"] is not None and st["starting_cash"] > 0
+                    else None
+                )
+                books_summary[bname] = {
+                    "starting_cash_usdt": st["starting_cash"],
+                    "cash_usdt": round(st["cash"], 4),
+                    "closed_trades": len(st["closed_trades"]),
+                    "realized_net_pnl_usdt": st["realized_net_pnl_usdt"],
+                    "net_return_pct": pct,
+                    "net_return_claim_allowed": st["net_return_claim_allowed"],
+                    "realized_pnl_ex_unknown_funding_usdt": st["realized_pnl_ex_unknown_funding_usdt"],
+                    "fees_paid_usdt": st["fees_paid_usdt"],
+                    "known_funding_paid_usdt": st["known_funding_paid_usdt"],
+                    "funding_complete": st["funding_complete"],
+                    "unknown_funding_events": st["unknown_funding_events"],
+                    "halted": st["halted"],
+                    "halt_reason": st["halt_reason"],
+                    "halted_at_utc": st["halted_at_utc"],
+                    "reconciled_bar_close_utc": st["reconciled_bar_close_utc"],
+                    "reconciliation_error_usdt": round(st["reconciliation_error_usdt"], 10),
+                    "open_position": st["open_pos"],
+                }
 
         latest_traces = []
-        if cycles:
+        if cycles and "decision_traces" in tables:
             last_cid = cycles[0]["cycle_id"]
-            t_rows = conn.execute(
-                "SELECT symbol, final_action, stand_aside_reason, trace_json, trace_hash FROM decision_traces WHERE cycle_id = ? ORDER BY symbol ASC",
+            for tr in conn.execute(
+                "SELECT symbol, final_action, stand_aside_reason, trace_json, trace_hash FROM decision_traces "
+                "WHERE cycle_id = ? ORDER BY symbol ASC",
                 (last_cid,),
-            ).fetchall()
-            for tr in t_rows:
+            ).fetchall():
                 parsed = json.loads(tr["trace_json"])
                 latest_traces.append(
                     {
@@ -1677,37 +2124,28 @@ def get_continuous_paper_status(db_path: Path = DEFAULT_LEDGER_PATH) -> dict[str
                 )
 
         pending = []
-        p_rows = conn.execute(
-            """
-            SELECT p.proposal_id, p.symbol, p.side, p.created_at_utc, p.expires_at_utc, p.proposal_json
-            FROM human_proposals p
-            LEFT JOIN human_decisions d ON p.proposal_id = d.proposal_id
-            WHERE d.proposal_id IS NULL
-            ORDER BY p.created_at_utc DESC
-            LIMIT 10
-            """
-        ).fetchall()
-        for pr in p_rows:
-            pending.append(json.loads(pr["proposal_json"]))
-
-        n_cycles = len(cycles)
-        val_status = (
-            "PENDING_INSUFFICIENT_PROSPECTIVE_SAMPLE"
-            if n_cycles < 168
-            else "PROSPECTIVE_WINDOW_ACCUMULATED_UNAUDITED"
-        )
-        val_note = (
-            f"当前仅累计 {n_cycles} 小时前瞻记录（目标 >= 168 小时），前瞻观察期未结束，数据不足以判断策略优劣。"
-            if n_cycles < 168
-            else f"已累计 {n_cycles} 小时前瞻记录，仍须核对资金费完整性、对照账本与停机情况后谨慎解读。"
-        )
+        if "human_proposals" in tables and "human_decisions" in tables:
+            for pr in conn.execute(
+                """
+                SELECT p.proposal_json FROM human_proposals p
+                LEFT JOIN human_decisions d ON p.proposal_id = d.proposal_id
+                WHERE d.proposal_id IS NULL
+                ORDER BY p.created_at_utc DESC
+                LIMIT 10
+                """
+            ).fetchall():
+                pending.append(json.loads(pr["proposal_json"]))
 
         return {
             "initialized": True,
             "db_path": _display_path(db_path),
-            "cycles_recorded": n_cycles,
-            "validation_status": val_status,
-            "validation_note": val_note,
+            "ledger_kind": kind,
+            "ledger_audit": audit,
+            "legacy_ledgers": legacy,
+            "cycles_recorded": len(cycles),
+            "prospective_validation": validation,
+            "validation_status": validation["validation_status"],
+            "validation_note": validation["validation_note"],
             "first_cutoff_utc": cycles[-1]["cutoff_hour_utc"] if cycles else None,
             "latest_cutoff_utc": cycles[0]["cutoff_hour_utc"] if cycles else None,
             "latest_mode": cycles[0]["mode"] if cycles else None,
