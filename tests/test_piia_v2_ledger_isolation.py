@@ -386,3 +386,187 @@ def test_signal_inputs_are_selected_at_common_cutoff():
     for sym in SYMBOLS:
         assert align["frames"][sym].index[-1] + ONE_H == cutoff
         assert align["last_close_by_symbol"][sym] == cutoff.isoformat()
+
+
+# ---------------------------------------------------------------- 5. pre-freeze write gate
+
+
+def _build_pre_freeze_live_ledger(
+    path: Path,
+    *,
+    freeze_start: datetime,
+    starting_cash: float = 100.0,
+    also_add_post_freeze_row: bool = False,
+) -> None:
+    """Create a schema-valid live_prospective SQLite ledger that contains a pre-freeze cycle (tmp_path only)."""
+    pre_cutoff = (pd.Timestamp(freeze_start) - ONE_H).isoformat()
+    pre_rec = (pd.Timestamp(freeze_start) - pd.Timedelta(minutes=45)).isoformat()
+    man = verify_piia_v2_frozen()["manifest_sha256"]
+    ver = load_v2_config()["version"]
+    with sqlite3.connect(path) as conn:
+        conn.execute(f"PRAGMA application_id={cp.APP_ID}")
+        conn.executescript(
+            """
+            CREATE TABLE cycles (
+                cycle_id TEXT PRIMARY KEY,
+                cutoff_hour_utc TEXT NOT NULL UNIQUE,
+                recorded_at_utc TEXT NOT NULL,
+                manifest_sha256 TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                pillars_summary_json TEXT NOT NULL,
+                cycle_hash TEXT NOT NULL,
+                capture_started_utc TEXT,
+                policy_version TEXT
+            );
+            CREATE TABLE ledger_events (
+                event_id TEXT PRIMARY KEY,
+                recorded_at_utc TEXT NOT NULL,
+                book_name TEXT NOT NULL,
+                event_kind TEXT NOT NULL,
+                symbol TEXT,
+                payload_json TEXT NOT NULL,
+                cash_after_usdt REAL NOT NULL
+            );
+            CREATE TABLE ledger_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TRIGGER immutable_cycles_upd BEFORE UPDATE ON cycles
+            BEGIN SELECT RAISE(ABORT, 'append-only cycles'); END;
+            CREATE TRIGGER immutable_cycles_del BEFORE DELETE ON cycles
+            BEGIN SELECT RAISE(ABORT, 'append-only cycles'); END;
+            """
+        )
+        conn.executemany(
+            "INSERT INTO ledger_meta(key, value) VALUES (?, ?)",
+            [
+                ("ledger_kind", cp.KIND_LIVE),
+                ("schema_version", cp.LEDGER_SCHEMA_VERSION),
+                ("created_at_utc", pre_rec),
+            ],
+        )
+        conn.execute(
+            "INSERT INTO cycles(cycle_id, cutoff_hour_utc, recorded_at_utc, manifest_sha256, mode, "
+            "pillars_summary_json, cycle_hash, capture_started_utc, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("c_pre", pre_cutoff, pre_rec, man, cp.MODE_LIVE, "{}", "hash_pre", pre_rec, ver),
+        )
+        if also_add_post_freeze_row:
+            post_cutoff = pd.Timestamp(freeze_start).isoformat()
+            post_rec = (pd.Timestamp(freeze_start) + pd.Timedelta(minutes=5)).isoformat()
+            conn.execute(
+                "INSERT INTO cycles(cycle_id, cutoff_hour_utc, recorded_at_utc, manifest_sha256, mode, "
+                "pillars_summary_json, cycle_hash, capture_started_utc, policy_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("c_post", post_cutoff, post_rec, man, cp.MODE_LIVE, "{}", "hash_post", post_rec, ver),
+            )
+        init_payload = json.dumps({"starting_cash": starting_cash, "mode": cp.MODE_LIVE, "book_name": "M4_full_piia_v2"})
+        conn.execute(
+            "INSERT INTO ledger_events(event_id, recorded_at_utc, book_name, event_kind, symbol, payload_json, cash_after_usdt) "
+            "VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            ("ev_pre", pre_rec, "M4_full_piia_v2", "init_book", init_payload, starting_cash),
+        )
+
+
+def test_pre_freeze_live_collection_rejected_without_creating_ledger_then_freeze_hour_starts_clean_500u(env, monkeypatch):
+    from fastapi.testclient import TestClient
+    from piia.intelligence.api import app
+    from piia.intelligence.cli import main as piia_main
+
+    freeze_start = pd.Timestamp(load_v2_config()["prospective_freeze_started_utc"]).to_pydatetime()
+
+    # 1. One hour before freeze: attempt live collection with 100 USDT via direct call, CLI, and FastAPI.
+    t_pre = freeze_start - timedelta(hours=1) + timedelta(minutes=15)
+    env["state"]["now"] = t_pre
+    env["state"]["snapshot"] = None  # rejected before collector or SQLite I/O
+
+    res_pre = cp.run_prospective_cycle(starting_cash=100.0)
+    assert res_pre["status"] == "rejected_before_freeze_start"
+    assert res_pre["ledger_written"] is False
+    assert not env["real"].exists()
+
+    # Also test 1 second before freeze_start (still falls into freeze_start - 1h cutoff).
+    env["state"]["now"] = freeze_start - timedelta(seconds=1)
+    env["state"]["snapshot"] = _aligned(t_pre)
+    assert cp.run_prospective_cycle(starting_cash=100.0)["status"] == "rejected_before_freeze_start"
+    assert not env["real"].exists()
+
+    # CLI route shares the same underlying gate and creates no ledger file.
+    cli_live = env["tmp"] / "cli_pre_freeze_live.sqlite"
+    assert piia_main(["agent-run", "--starting-cash", "100", "--db", str(cli_live)]) == 3
+    assert not cli_live.exists()
+
+    # FastAPI route shares the same underlying gate and creates no ledger file.
+    api_live = env["tmp"] / "api_pre_freeze_live.sqlite"
+    monkeypatch.setenv("PIIA_V2_LEDGER_PATH", str(api_live))
+    with TestClient(app) as client:
+        resp = client.post("/agent-v2/run-cycle", json={"demo_mode": False, "starting_cash": 100.0})
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "rejected_before_freeze_start"
+        assert resp.json()["ledger_written"] is False
+    assert not api_live.exists()
+
+    # 2. Exact freeze start hour: first live collection with 500 USDT succeeds with clean 500 starting_cash.
+    t_start = freeze_start + timedelta(minutes=5)
+    env["state"]["now"] = t_start
+    env["state"]["snapshot"] = _aligned(t_start)
+    res_ok = cp.run_prospective_cycle(starting_cash=500.0)
+    assert res_ok["status"] == "recorded_prospective_cycle"
+    assert res_ok["cutoff_hour_utc"] == pd.Timestamp(freeze_start).isoformat()
+    assert env["real"].is_file()
+
+    st = cp.get_continuous_paper_status()
+    assert st["initialized"] is True
+    assert st["usable_for_prospective_validation"] is True
+    assert st["cycles_recorded"] == 1
+    assert st["prospective_validation"]["counted_observations"] == 1
+    assert st["prospective_validation"]["longest_contiguous_hours"] == 1
+    for book_name, book in st["books"].items():
+        assert book["starting_cash_usdt"] == 500.0, f"{book_name} carried wrong starting cash"
+
+
+def test_existing_live_ledger_with_pre_freeze_cycle_is_flagged_invalid_and_refuses_writes_byte_for_byte(env, monkeypatch):
+    from fastapi.testclient import TestClient
+    from piia.intelligence.api import app
+
+    freeze_start = pd.Timestamp(load_v2_config()["prospective_freeze_started_utc"]).to_pydatetime()
+    contam = env["tmp"] / "pre_freeze_live.sqlite"
+    contam_both = env["tmp"] / "pre_and_post_live.sqlite"
+    _build_pre_freeze_live_ledger(contam, freeze_start=freeze_start, starting_cash=100.0, also_add_post_freeze_row=False)
+    _build_pre_freeze_live_ledger(contam_both, freeze_start=freeze_start, starting_cash=100.0, also_add_post_freeze_row=True)
+    sha_before = _sha(contam)
+    sha2_before = _sha(contam_both)
+
+    audit = cp.inspect_ledger(contam)
+    assert audit["ledger_kind_label"] == cp.KIND_LIVE
+    assert audit["contaminated_pre_freeze"] is True
+    assert audit["pre_freeze_cycles"] == 1
+    assert audit["pre_freeze_events"] >= 1
+    assert audit["classification"] == "contaminated_pre_freeze_cycles"
+    assert audit["usable_as_live_prospective_ledger"] is False
+
+    # Move clock to post-freeze hour with valid aligned snapshot: continuation writes MUST fail closed.
+    t_post = freeze_start + timedelta(hours=1, minutes=5)
+    env["state"]["now"] = t_post
+    env["state"]["snapshot"] = _aligned(t_post)
+
+    with pytest.raises(cp.LedgerKindError, match="pre-freeze"):
+        cp.run_prospective_cycle(db_path=contam, starting_cash=500.0)
+    with pytest.raises(cp.LedgerKindError, match="pre-freeze"):
+        cp._init_db(contam, ledger_kind=cp.KIND_LIVE)
+    with pytest.raises(cp.LedgerKindError, match="pre-freeze"):
+        cp.approve_human_proposal("any", choice="reject", db_path=contam)
+
+    monkeypatch.setenv("PIIA_V2_LEDGER_PATH", str(contam))
+    with TestClient(app) as client:
+        resp = client.post("/agent-v2/run-cycle", json={"demo_mode": False, "starting_cash": 500.0})
+        assert resp.status_code == 400
+        assert "pre-freeze" in resp.json()["detail"].lower()
+
+    # Even if a contaminated ledger already contains a post-freeze row, validation stays invalid with 0 counted.
+    for path, expected_cycles in ((contam, 1), (contam_both, 2)):
+        st = cp.get_continuous_paper_status(path)
+        assert st["usable_for_prospective_validation"] is False
+        assert st["cycles_recorded"] == expected_cycles
+        assert st["books"]["M4_full_piia_v2"]["starting_cash_usdt"] == 100.0
+        assert st["validation_status"] == "INVALID_PRE_FREEZE_CONTAMINATED_LEDGER"
+        assert st["prospective_validation"]["counted_observations"] == 0
+
+    assert _sha(contam) == sha_before
+    assert _sha(contam_both) == sha2_before
+

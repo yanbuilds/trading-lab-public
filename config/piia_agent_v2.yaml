@@ -1,13 +1,14 @@
-# Personal Investment Intelligence Agent (PIIA v2.2) Frozen Policy.
+# Personal Investment Intelligence Agent (PIIA v2.2.1) Frozen Policy.
 # Retains ALL strategy, cost, and risk thresholds from v2.0.0 unchanged (zero tuning for PnL).
-# v2.2.0: ledger evidence-kind isolation, three-contract closed-bar alignment gate, and
-# contiguous-hour prospective counting. v2.0/v2.1 ledgers and replays are never counted here.
+# v2.2.1: ledger evidence-kind isolation, three-contract closed-bar alignment gate,
+# contiguous-hour prospective counting, pre-freeze live write rejection before SQLite I/O,
+# and read-only invalidation of pre-freeze-contaminated live ledgers.
 
 protocol_id: PIIA_PERSONAL_INVESTMENT_INTELLIGENCE_AGENT_V2
-version: "2.2.0"
-base_commit_reviewed: "7e4cc510e2ea42b9691aa4360b17f87599007271"
+version: "2.2.1"
+base_commit_reviewed: "7d46223d33d0d8d2aaba952e064cacdb2ab4ec52"
 precommitted_before_post_2026_11_16_holdout: false
-prospective_freeze_started_utc: "2026-11-23T08:00:00+00:00"
+prospective_freeze_started_utc: "2026-11-23T09:00:00+00:00"
 tuning_on_holdout_forbidden: true
 retain_negative_and_null_results: true
 live_order_permissions: false

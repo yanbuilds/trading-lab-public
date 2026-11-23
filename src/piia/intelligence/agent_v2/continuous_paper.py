@@ -116,13 +116,62 @@ def _ts_utc(value: str | pd.Timestamp | datetime) -> pd.Timestamp:
     return ts.tz_localize("UTC") if ts.tzinfo is None else ts.tz_convert("UTC")
 
 
+def _preflight_existing_db_for_write(db_path: Path, *, required_kind: str | None = None) -> None:
+    """Read-only check before any SQLite write open; never creates or modifies rejected files."""
+    db_path = Path(db_path)
+    if not db_path.is_file() or db_path.stat().st_size == 0:
+        return
+    ro = _open_readonly(db_path)
+    try:
+        app = ro.execute("PRAGMA application_id").fetchone()[0]
+        if app not in (0, APP_ID):
+            raise ValueError(f"Unrelated SQLite database at {_display_path(db_path)}")
+        tables = _sqlite_tables(ro)
+        if not tables:
+            return
+        if "ledger_meta" not in tables:
+            raise LedgerKindError(
+                f"Legacy unlabelled ledger at {_display_path(db_path)} (pre-v2.2, may mix demo and live cycles); "
+                "it is preserved read-only and cannot be written. Use `python -m piia agent-inspect-ledger`."
+            )
+        actual_kind = _read_ledger_kind(ro)
+    finally:
+        ro.close()
+
+    if actual_kind not in MODE_TO_KIND.values():
+        raise LedgerKindError(
+            f"Ledger {_display_path(db_path)} has missing or invalid ledger_kind={actual_kind!r}; refused for write."
+        )
+    if required_kind is not None and actual_kind != required_kind:
+        raise LedgerKindError(
+            f"Ledger {_display_path(db_path)} is labelled {actual_kind!r}; refusing to write {required_kind!r} records "
+            "(live, demo, and injected evidence must use separate ledgers)."
+        )
+    if actual_kind == KIND_LIVE:
+        audit = inspect_ledger(db_path)
+        if audit.get("contaminated_pre_freeze"):
+            raise LedgerKindError(
+                f"Live ledger {_display_path(db_path)} already contains pre-freeze records "
+                f"(pre_freeze_cycles={audit['pre_freeze_cycles']}, pre_freeze_events={audit['pre_freeze_events']}, "
+                f"earliest_cutoff_utc={audit.get('earliest_cutoff_utc')}, "
+                f"freeze_start={audit['prospective_freeze_started_utc']}); "
+                "preserved read-only and refused for continuation."
+            )
+        if str(audit.get("classification", "")).startswith("mixed"):
+            raise LedgerKindError(
+                f"Live ledger {_display_path(db_path)} contains mixed demo/injected records; "
+                "preserved read-only and refused for continuation."
+            )
+
+
 def _init_db(db_path: Path, *, ledger_kind: str | None = None) -> sqlite3.Connection:
-    """Open (or create) a ledger. Unlabelled legacy ledgers are refused for any write path."""
+    """Open (or create) a ledger. Unlabelled, mismatched, or pre-freeze-contaminated live ledgers fail closed."""
     db_path = Path(db_path)
     if ledger_kind is not None and ledger_kind not in MODE_TO_KIND.values():
         raise LedgerKindError(f"Unknown ledger kind {ledger_kind!r}")
     if ledger_kind is not None and ledger_kind != KIND_LIVE and _same_file(db_path, REAL_LEDGER_PATH):
         raise LedgerKindError("Demo or injected records can never be written to the real prospective ledger path.")
+    _preflight_existing_db_for_write(db_path, required_kind=ledger_kind)
     db_path.parent.mkdir(parents=True, exist_ok=True)
     existed = db_path.exists() and db_path.stat().st_size > 0
     conn = sqlite3.connect(db_path)
@@ -132,12 +181,6 @@ def _init_db(db_path: Path, *, ledger_kind: str | None = None) -> sqlite3.Connec
         conn.close()
         raise ValueError(f"Unrelated SQLite database at {_display_path(db_path)}")
     had_tables = bool(_sqlite_tables(conn))
-    if had_tables and "ledger_meta" not in _sqlite_tables(conn):
-        conn.close()
-        raise LedgerKindError(
-            f"Legacy unlabelled ledger at {_display_path(db_path)} (pre-v2.2, may mix demo and live cycles); "
-            "it is preserved read-only and cannot be written. Use `python -m piia agent-inspect-ledger`."
-        )
     if not existed or app == 0:
         conn.execute(f"PRAGMA application_id={APP_ID}")
 
@@ -1072,6 +1115,30 @@ def run_prospective_cycle(
     cfg = load_v2_config()
     now = _utc_now()
     now_iso = now.isoformat()
+    freeze_start = _ts_utc(cfg["prospective_freeze_started_utc"])
+    expected_now_cutoff = _ts_utc(now).floor("h")
+
+    # Reject writes to legacy, mismatched, mixed, or pre-freeze-contaminated ledgers before any I/O.
+    if db_path.is_file() and db_path.stat().st_size > 0:
+        _preflight_existing_db_for_write(db_path, required_kind=required_kind)
+
+    # Hard entry gate: refuse live prospective collection strictly before prospective_freeze_started_utc
+    # before fetching market data or opening/creating SQLite (no cash/positions/cursors can cross freeze).
+    if mode == MODE_LIVE and expected_now_cutoff < freeze_start:
+        return {
+            "status": "rejected_before_freeze_start",
+            "reasons": [
+                f"before_prospective_freeze_start:expected_cutoff={expected_now_cutoff.isoformat()}"
+                f"<freeze_start={freeze_start.isoformat()}"
+            ],
+            "expected_cutoff_utc": expected_now_cutoff.isoformat(),
+            "prospective_freeze_started_utc": freeze_start.isoformat(),
+            "mode": mode,
+            "db_path": _display_path(db_path),
+            "ledger_written": False,
+            "live_orders_submitted": False,
+            "order_permissions": False,
+        }
 
     if snapshot_override is not None:
         collected = snapshot_override
@@ -1850,9 +1917,23 @@ def _mode_kind(mode: str | None) -> str:
 def inspect_ledger(db_path: Path) -> dict[str, Any]:
     """Read-only compatibility audit of a PIIA v2 ledger file. Never modifies the file."""
     db_path = Path(db_path)
+    cfg = load_v2_config()
+    freeze_start = _ts_utc(cfg["prospective_freeze_started_utc"])
     out: dict[str, Any] = {"db_path": _display_path(db_path), "exists": db_path.is_file()}
     if not out["exists"]:
-        out.update({"classification": "absent", "usable_as_live_prospective_ledger": False, "notes": []})
+        out.update(
+            {
+                "classification": "absent",
+                "contaminated_pre_freeze": False,
+                "pre_freeze_cycles": 0,
+                "pre_freeze_events": 0,
+                "pre_freeze_proposals": 0,
+                "earliest_cutoff_utc": None,
+                "prospective_freeze_started_utc": freeze_start.isoformat(),
+                "usable_as_live_prospective_ledger": False,
+                "notes": [],
+            }
+        )
         return out
     conn = _open_readonly(db_path)
     try:
@@ -1860,32 +1941,79 @@ def inspect_ledger(db_path: Path) -> dict[str, Any]:
         kind = _read_ledger_kind(conn)
         modes: dict[str, int] = {}
         manifests: dict[str, int] = {}
+        pre_freeze_cycles = 0
+        earliest_cutoff_ts: pd.Timestamp | None = None
+        earliest_cutoff_utc: str | None = None
         if "cycles" in tables:
-            for r in conn.execute("SELECT mode, manifest_sha256, COUNT(*) AS n FROM cycles GROUP BY mode, manifest_sha256"):
-                modes[r["mode"]] = modes.get(r["mode"], 0) + int(r["n"])
-                manifests[r["manifest_sha256"]] = manifests.get(r["manifest_sha256"], 0) + int(r["n"])
+            for r in conn.execute("SELECT * FROM cycles"):
+                r_keys = set(r.keys())
+                m = str(r["mode"])
+                man = str(r["manifest_sha256"])
+                modes[m] = modes.get(m, 0) + 1
+                manifests[man] = manifests.get(man, 0) + 1
+                cycle_pre = False
+                for col in ("cutoff_hour_utc", "recorded_at_utc"):
+                    try:
+                        ts = _ts_utc(r[col])
+                        if col == "cutoff_hour_utc" and (earliest_cutoff_ts is None or ts < earliest_cutoff_ts):
+                            earliest_cutoff_ts = ts
+                            earliest_cutoff_utc = str(r[col])
+                        if ts < freeze_start:
+                            cycle_pre = True
+                    except (KeyError, TypeError, ValueError):
+                        cycle_pre = True
+                if "capture_started_utc" in r_keys and r["capture_started_utc"]:
+                    try:
+                        if _ts_utc(r["capture_started_utc"]) < freeze_start:
+                            cycle_pre = True
+                    except (TypeError, ValueError):
+                        cycle_pre = True
+                if cycle_pre:
+                    pre_freeze_cycles += 1
         book_modes: dict[str, int] = {}
+        pre_freeze_events = 0
         if "ledger_events" in tables:
-            for r in conn.execute("SELECT payload_json FROM ledger_events WHERE event_kind = 'init_book'"):
-                m = str(json.loads(r["payload_json"]).get("mode") or "unknown")
-                book_modes[m] = book_modes.get(m, 0) + 1
+            for r in conn.execute("SELECT event_kind, recorded_at_utc, payload_json FROM ledger_events"):
+                if r["event_kind"] == "init_book":
+                    m = str(json.loads(r["payload_json"]).get("mode") or "unknown")
+                    book_modes[m] = book_modes.get(m, 0) + 1
+                try:
+                    if _ts_utc(r["recorded_at_utc"]) < freeze_start:
+                        pre_freeze_events += 1
+                except (TypeError, ValueError):
+                    pre_freeze_events += 1
+        pre_freeze_proposals = 0
+        if "human_proposals" in tables:
+            for r in conn.execute("SELECT created_at_utc FROM human_proposals"):
+                try:
+                    if _ts_utc(r["created_at_utc"]) < freeze_start:
+                        pre_freeze_proposals += 1
+                except (TypeError, ValueError):
+                    pre_freeze_proposals += 1
     finally:
         conn.close()
 
     kinds_seen = {_mode_kind(m) for m in modes} | {_mode_kind(m) for m in book_modes if m != "unknown"}
-    if not modes and not book_modes:
+    contaminated_pre_freeze = bool(
+        kind == KIND_LIVE and (pre_freeze_cycles > 0 or pre_freeze_events > 0 or pre_freeze_proposals > 0)
+    )
+    if not modes and not book_modes and pre_freeze_proposals == 0:
         classification = "empty"
+    elif len(kinds_seen) > 1 or (kind == KIND_LIVE and kinds_seen and kinds_seen != {KIND_LIVE}):
+        classification = "mixed_demo_live_or_injected"
+    elif contaminated_pre_freeze:
+        classification = "contaminated_pre_freeze_cycles"
     elif not kinds_seen:
         classification = "no_cycles_unlabelled_book_events"
-    elif len(kinds_seen) > 1:
-        classification = "mixed_demo_live_or_injected"
     else:
         classification = f"{next(iter(kinds_seen))}_only"
     label = kind if kind is not None else "legacy_unlabeled_pre_v2_2"
     usable = bool(
         kind == KIND_LIVE
         and classification in {"empty", f"{KIND_LIVE}_only"}
-        and _same_file(db_path, REAL_LEDGER_PATH)
+        and not contaminated_pre_freeze
+        and not _same_file(db_path, DEMO_LEDGER_PATH)
+        and not any(_same_file(db_path, lp) for lp in LEGACY_LEDGER_PATHS)
     )
     notes: list[str] = []
     if kind is None:
@@ -1895,6 +2023,12 @@ def inspect_ledger(db_path: Path) -> dict[str, Any]:
         )
     if classification.startswith("mixed"):
         notes.append("Mixed evidence: demo or injected cycles share simulated balances with live cycles; invalid for validation.")
+    if contaminated_pre_freeze:
+        notes.append(
+            "Contains pre-freeze cycles or book events recorded before prospective_freeze_started_utc: "
+            "simulated starting_cash, positions, halts, or cursors may carry pre-freeze state; "
+            "preserved read-only, refused for continuation writes, and invalid for prospective validation."
+        )
     out.update(
         {
             "ledger_kind_label": label,
@@ -1902,6 +2036,12 @@ def inspect_ledger(db_path: Path) -> dict[str, Any]:
             "cycle_modes": modes,
             "cycle_manifests": manifests,
             "book_init_modes": book_modes,
+            "contaminated_pre_freeze": contaminated_pre_freeze,
+            "pre_freeze_cycles": pre_freeze_cycles,
+            "pre_freeze_events": pre_freeze_events,
+            "pre_freeze_proposals": pre_freeze_proposals,
+            "earliest_cutoff_utc": earliest_cutoff_utc,
+            "prospective_freeze_started_utc": freeze_start.isoformat(),
             "usable_as_live_prospective_ledger": usable,
             "notes": notes,
         }
@@ -1915,6 +2055,7 @@ def compute_prospective_validation(
     ledger_kind: str | None,
     cfg: dict[str, Any],
     manifest_sha256: str,
+    ledger_audit: dict[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """Count only post-freeze, on-time, live observations recorded by the current frozen code."""
@@ -1935,6 +2076,15 @@ def compute_prospective_validation(
             {
                 "validation_status": "NOT_A_PROSPECTIVE_LEDGER",
                 "validation_note": "非真实前瞻账本（演示/注入/旧版未标注），不计入任何验证计数。",
+            }
+        )
+        return base
+    if ledger_audit is not None and ledger_audit.get("contaminated_pre_freeze"):
+        base.update(
+            {
+                "excluded_cycles": {"ledger_contaminated_pre_freeze": len(cycle_rows)},
+                "validation_status": "INVALID_PRE_FREEZE_CONTAMINATED_LEDGER",
+                "validation_note": "该真实账本含有冻结起算前的周期或账户事件，初始本金、持仓、停机或游标可能已受影响，不可用于当前前瞻验证（原文件只读保留）。",
             }
         )
         return base
@@ -2034,11 +2184,14 @@ def get_continuous_paper_status(db_path: Path | None = None, *, demo: bool = Fal
 
     audit = inspect_ledger(db_path)
     if not db_path.is_file():
-        validation = compute_prospective_validation([], ledger_kind=KIND_DEMO if demo else KIND_LIVE, cfg=cfg, manifest_sha256=manifest_sha)
+        validation = compute_prospective_validation(
+            [], ledger_kind=KIND_DEMO if demo else KIND_LIVE, cfg=cfg, manifest_sha256=manifest_sha, ledger_audit=audit
+        )
         return {
             "initialized": False,
             "db_path": _display_path(db_path),
             "ledger_audit": audit,
+            "usable_for_prospective_validation": not demo,
             "legacy_ledgers": legacy,
             "cycles_recorded": 0,
             "prospective_validation": validation,
@@ -2066,7 +2219,7 @@ def get_continuous_paper_status(db_path: Path | None = None, *, demo: bool = Fal
                 c.setdefault("policy_version", None)
         effective_kind = kind if not audit.get("classification", "").startswith("mixed") else None
         validation = compute_prospective_validation(
-            cycles, ledger_kind=effective_kind, cfg=cfg, manifest_sha256=manifest_sha
+            cycles, ledger_kind=effective_kind, cfg=cfg, manifest_sha256=manifest_sha, ledger_audit=audit
         )
 
         books_summary: dict[str, Any] = {}
@@ -2141,6 +2294,7 @@ def get_continuous_paper_status(db_path: Path | None = None, *, demo: bool = Fal
             "db_path": _display_path(db_path),
             "ledger_kind": kind,
             "ledger_audit": audit,
+            "usable_for_prospective_validation": bool(audit.get("usable_as_live_prospective_ledger")),
             "legacy_ledgers": legacy,
             "cycles_recorded": len(cycles),
             "prospective_validation": validation,

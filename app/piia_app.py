@@ -162,7 +162,10 @@ try:
                 st.error(f"离线演示周期运行失败：{exc}")
 
         if st.session_state.get("ag2_last_cycle"):
-            st.json(st.session_state["ag2_last_cycle"])
+            last_res = st.session_state["ag2_last_cycle"]
+            if str(last_res.get("status") or "").startswith("rejected_"):
+                st.warning(f"本轮周期未写入账本（`{last_res.get('status')}`）：{last_res.get('reasons')}")
+            st.json(last_res)
 
         ag_view = st.radio(
             "查看账本", ["真实前瞻账本", "合成演示账本"], horizontal=True, key="ag2_ledger_view",
@@ -170,6 +173,7 @@ try:
         ag_demo_view = ag_view == "合成演示账本"
         cp_status = get_continuous_paper_status(default_ledger_path(demo=ag_demo_view), demo=ag_demo_view)
         pv = cp_status.get("prospective_validation") or {}
+        audit_cur = cp_status.get("ledger_audit") or {}
         st.caption(
             f"前瞻验证状态: **{cp_status.get('validation_status')}** — {cp_status.get('validation_note', '')} | "
             f"计入验证的真实观测: **{pv.get('counted_observations', 0)}** 小时 | "
@@ -177,6 +181,11 @@ try:
             f"观测区间内缺失: **{pv.get('missing_hours_within_observed_span', 0)}** 小时 | "
             f"冻结起算 `{pv.get('freeze_started_utc')}` 以来缺失: **{pv.get('missing_hours_since_freeze')}** 小时"
         )
+        if audit_cur.get("exists") and not ag_demo_view and not audit_cur.get("usable_as_live_prospective_ledger"):
+            st.error(
+                f"当前真实账本 `{audit_cur.get('db_path')}` 不可用于当前前瞻验证（"
+                f"classification=`{audit_cur.get('classification')}`）：{' '.join(audit_cur.get('notes') or [])}"
+            )
         for lg in cp_status.get("legacy_ledgers") or []:
             st.warning(
                 f"旧账本 `{lg.get('db_path')}`（{lg.get('ledger_kind_label')}, {lg.get('classification')}）已原样保留、"
