@@ -38,3 +38,4 @@ data/piia/**
 
 # extended public cache for strategy comparison; do not commit raw OHLCV
 data/perps-extended/
+data/piia_v2_eval/

@@ -32,6 +32,19 @@ class BacktestResult:
         mask = self.nav.index >= pd.Timestamp(start)
         if end is not None:
             mask &= self.nav.index <= pd.Timestamp(end)
+        sliced_events = self.events
+        if not self.events.empty and "timestamp_utc" in self.events.columns:
+            ev_ts = pd.to_datetime(self.events["timestamp_utc"], utc=True)
+            start_utc = pd.Timestamp(start)
+            if start_utc.tzinfo is None:
+                start_utc = start_utc.tz_localize("UTC")
+            ev_mask = ev_ts >= start_utc
+            if end is not None:
+                end_utc = pd.Timestamp(end)
+                if end_utc.tzinfo is None:
+                    end_utc = end_utc.tz_localize("UTC") + pd.Timedelta(days=1)
+                ev_mask &= ev_ts <= end_utc
+            sliced_events = self.events.loc[ev_mask].copy()
         return BacktestResult(
             nav=self.nav.loc[mask],
             cash=self.cash.loc[mask],
@@ -45,6 +58,7 @@ class BacktestResult:
             halted=self.halted.loc[mask],
             config_label=self.config_label,
             notes=list(self.notes),
+            events=sliced_events,
         )
 
 

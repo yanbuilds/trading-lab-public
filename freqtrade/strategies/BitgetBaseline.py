@@ -73,8 +73,10 @@ class BitgetBaseline(IStrategy):
             return 0.
         market=self.dp.market(pair)
         limits=market['limits']; step=market['precision']['amount']
+        taker=float(market.get('taker') or .0006)
+        contract_size=float(market.get('contractSize') or 1.)
         spec=Spec(pair,limits['amount']['min'] or step,step,limits['cost']['min'] or 5,
-                  contract_size=market.get('contractSize',1))
+                  taker=taker,contract_size=contract_size)
         qty,_=size_order(self.wallets.get_total_stake_amount(),self.wallets.get_free('USDT'),current_rate,
                          2*rows.iloc[-1].atr,spec,leverage=leverage)
         stake=qty*spec.contract_size*current_rate/leverage
@@ -85,8 +87,10 @@ class BitgetBaseline(IStrategy):
             rows=self._closed(pair,current_time)
             if rows.empty or pd.Timestamp(current_time)-(rows.iloc[-1].date+pd.Timedelta(hours=1))>pd.Timedelta(hours=2):
                 return False
-            contract_size = float(self.dp.market(pair)['contractSize'])
-            spec = Spec(pair, 1., 1., 0., taker=.0006, contract_size=contract_size)
+            market = self.dp.market(pair)
+            contract_size = float(market.get('contractSize') or 1.)
+            taker = float(market.get('taker') or .0006)
+            spec = Spec(pair, 1., 1., 0., taker=taker, contract_size=contract_size)
             quantity, equity = float(amount), float(self.wallets.get_total_stake_amount())
             if not math.isfinite(quantity) or not math.isfinite(equity) or quantity<=0 or equity<=0:
                 return False

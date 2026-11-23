@@ -4,13 +4,18 @@ from datetime import date, datetime, time, timedelta
 from functools import lru_cache
 
 import pandas as pd
-import pandas_market_calendars as mcal
 
 from trading_lab.timeutil import NEW_YORK, UTC, now_utc
 
 
 @lru_cache(maxsize=4)
 def nyse_calendar():
+    try:
+        import pandas_market_calendars as mcal
+    except ImportError as exc:
+        raise ImportError(
+            "pandas_market_calendars is required for NYSE ETF calendar operations; install `trading-lab[etf]`."
+        ) from exc
     return mcal.get_calendar("XNYS")
 
 

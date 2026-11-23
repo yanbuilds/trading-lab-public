@@ -359,3 +359,146 @@ def paper_kill(payload: KillIn):
         return s.paper.set_kill(payload.actor, payload.enabled, payload.reason)
     finally:
         s.session.close()
+
+
+class AssistantPlanIn(BaseModel):
+    symbol: str
+    side: str
+    equity_usdt: float = 500.0
+    entry_price: float | None = None
+    stop_loss: float | None = None
+    take_profit: float | None = None
+    target_rr: float | None = 2.5
+    leverage: float = 2.0
+    risk_pct: float = 1.0
+    order_type: str = "limit"
+    fetch_live_context: bool = False
+
+
+class AssistantPositionIn(BaseModel):
+    symbol: str
+    side: str
+    entry_price: float
+    qty: float
+    stop_loss: float
+    leverage: float = 2.0
+    mark_price: float | None = None
+    fetch_live: bool = False
+
+
+@app.get("/assistant/scan")
+def assistant_scan(
+    demo: bool = False,
+    equity_usdt: float = 500.0,
+    leverage: float = 2.0,
+    risk_pct: float = 1.0,
+    order_type: str = "limit",
+):
+    from piia.intelligence.trade_assistant import scan_market_signals
+    try:
+        return scan_market_signals(
+            equity_usdt=equity_usdt,
+            leverage=leverage,
+            risk_fraction=risk_pct / 100.0,
+            order_type=order_type,
+            demo_mode=demo,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/assistant/plan-trade")
+def assistant_plan_trade(payload: AssistantPlanIn):
+    from piia.intelligence.trade_assistant import build_trade_plan
+    try:
+        return build_trade_plan(
+            symbol=payload.symbol,
+            side=payload.side,
+            equity_usdt=payload.equity_usdt,
+            entry_price=payload.entry_price,
+            stop_loss=payload.stop_loss,
+            take_profit=payload.take_profit,
+            target_rr=payload.target_rr,
+            leverage=payload.leverage,
+            risk_pct=payload.risk_pct,
+            order_type=payload.order_type,
+            fetch_live_context=payload.fetch_live_context,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/assistant/position-advice")
+def assistant_position_advice(payload: AssistantPositionIn):
+    from piia.intelligence.trade_assistant import advise_open_position
+    try:
+        return advise_open_position(
+            symbol=payload.symbol,
+            side=payload.side,
+            entry_price=payload.entry_price,
+            qty=payload.qty,
+            stop_loss=payload.stop_loss,
+            leverage=payload.leverage,
+            mark_price=payload.mark_price,
+            fetch_live=payload.fetch_live,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class AgentCycleIn(BaseModel):
+    demo_mode: bool = False
+    starting_cash: float = 500.0
+
+
+class AgentProposalDecisionIn(BaseModel):
+    choice: str
+    actor: str = "local-investor"
+    note: str = ""
+
+
+def _resolve_v2_ledger_path() -> Path:
+    import os
+    from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH
+    override = os.environ.get("PIIA_V2_LEDGER_PATH")
+    return Path(override) if override else DEFAULT_LEDGER_PATH
+
+
+@app.get("/agent-v2/verify-freeze")
+def agent_v2_verify_freeze():
+    from piia.intelligence.agent_v2.manifest import verify_piia_v2_frozen
+    return verify_piia_v2_frozen()
+
+
+@app.get("/agent-v2/status")
+def agent_v2_status():
+    from piia.intelligence.agent_v2.continuous_paper import get_continuous_paper_status
+    return get_continuous_paper_status(_resolve_v2_ledger_path())
+
+
+@app.post("/agent-v2/run-cycle")
+def agent_v2_run_cycle(payload: AgentCycleIn):
+    from piia.intelligence.agent_v2.continuous_paper import run_prospective_cycle
+    try:
+        return run_prospective_cycle(
+            db_path=_resolve_v2_ledger_path(),
+            starting_cash=payload.starting_cash,
+            demo_mode=payload.demo_mode,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/agent-v2/proposals/{proposal_id}/decision")
+def agent_v2_decide_proposal(proposal_id: str, payload: AgentProposalDecisionIn):
+    from piia.intelligence.agent_v2.continuous_paper import approve_human_proposal
+    try:
+        return approve_human_proposal(
+            proposal_id,
+            choice=payload.choice,
+            actor=payload.actor,
+            note=payload.note,
+            db_path=_resolve_v2_ledger_path(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

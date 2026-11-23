@@ -45,6 +45,54 @@ def main(argv: list[str] | None = None) -> int:
     p_liq = sub.add_parser("liquidity-positioning", help="deterministic liquidity and positioning research assessment; no orders")
     p_liq.add_argument("--out", default=None, help="optional JSON path under artifacts or another local path")
     p_liq.add_argument("--prior-json", default=None, help="optional prior official-state JSON with as_of_utc")
+
+    p_scan = sub.add_parser("scan", help="v2 trading assistant: live/demo multi-contract regime, signal radar & auto trade tickets")
+    p_scan.add_argument("--demo", action="store_true", help="use labeled synthetic offline snapshot instead of live network")
+    p_scan.add_argument("--equity", type=float, default=None, help="account equity in USDT (defaults to trading_policy_v2.yaml)")
+    p_scan.add_argument("--leverage", type=float, default=None, help="isolated leverage (defaults to trading_policy_v2.yaml)")
+    p_scan.add_argument("--risk-pct", type=float, default=None, help="per-trade risk budget percentage, e.g. 1.0")
+    p_scan.add_argument("--order-type", choices=["limit", "market"], default="limit")
+    p_scan.add_argument("--json", action="store_true", help="output full JSON instead of formatted radar table")
+    p_scan.add_argument("--out", default=None, help="optional JSON file path to save scan output")
+
+    p_plan = sub.add_parser("plan-trade", help="v2 pre-trade position sizing, breakeven, TP ladder & liquidation calculator")
+    p_plan.add_argument("--symbol", required=True, help="e.g. BTCUSDT, XAUUSDT, NDX100USDT")
+    p_plan.add_argument("--side", required=True, choices=["long", "short"])
+    p_plan.add_argument("--equity", type=float, default=500.0, help="account equity in USDT")
+    p_plan.add_argument("--entry", type=float, default=None, help="planned entry price (fetches live mark if omitted with --live)")
+    p_plan.add_argument("--stop", type=float, default=None, help="stop-loss price (uses 2*ATR14 if omitted with --live)")
+    p_plan.add_argument("--tp", type=float, default=None, help="optional custom take-profit target price")
+    p_plan.add_argument("--rr", type=float, default=2.5, help="default R-multiple target if --tp is omitted")
+    p_plan.add_argument("--leverage", type=float, default=2.0)
+    p_plan.add_argument("--risk-pct", type=float, default=1.0, help="risk budget percentage of equity, e.g. 1.0")
+    p_plan.add_argument("--order-type", choices=["limit", "market"], default="limit")
+    p_plan.add_argument("--live", action="store_true", help="fetch live Bitget orderbook, tiers, funding & candles")
+
+    p_pos = sub.add_parser("position-advice", help="v2 open-position PnL, R-multiple, breakeven & trailing stop advisor")
+    p_pos.add_argument("--symbol", required=True)
+    p_pos.add_argument("--side", required=True, choices=["long", "short"])
+    p_pos.add_argument("--entry", type=float, required=True)
+    p_pos.add_argument("--qty", type=float, required=True)
+    p_pos.add_argument("--stop", type=float, required=True)
+    p_pos.add_argument("--leverage", type=float, default=2.0)
+    p_pos.add_argument("--mark", type=float, default=None, help="current mark price (or pass --live)")
+    p_pos.add_argument("--live", action="store_true", help="fetch live Bitget mark price and closed 1h candles")
+
+    sub.add_parser("agent-verify-freeze", help="verify SHA-256 freeze manifest of PIIA v2 protocol and modules")
+    p_arun = sub.add_parser("agent-run", help="run one prospective PIIA v2 6-pillar cycle and append to continuous paper ledger")
+    p_arun.add_argument("--demo", action="store_true", help="run on labeled synthetic snapshot without network")
+    p_arun.add_argument("--starting-cash", type=float, default=500.0)
+    p_arun.add_argument("--db", default=None, help="optional sqlite path (defaults to data/piia/piia_v2_continuous.sqlite)")
+
+    p_astat = sub.add_parser("agent-status", help="inspect PIIA v2 continuous prospective paper ledger & shadow baseline comparison")
+    p_astat.add_argument("--db", default=None)
+
+    p_aapp = sub.add_parser("agent-approve", help="explicitly approve or reject a pending PIIA v2 human paper proposal (never live)")
+    p_aapp.add_argument("--proposal-id", required=True)
+    p_aapp.add_argument("--choice", required=True, choices=["approve", "reject"])
+    p_aapp.add_argument("--actor", default="local-investor")
+    p_aapp.add_argument("--note", default="")
+    p_aapp.add_argument("--db", default=None)
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parents[3]
@@ -195,6 +243,87 @@ def main(argv: list[str] | None = None) -> int:
             out = Path(args.out)
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text_out + "\n", encoding="utf-8")
+        return 0
+    if args.cmd == "scan":
+        import json
+        from piia.intelligence.trade_assistant import format_scan_table, scan_market_signals
+        result = scan_market_signals(
+            equity_usdt=args.equity,
+            leverage=args.leverage,
+            risk_fraction=(args.risk_pct / 100.0) if args.risk_pct is not None else None,
+            order_type=args.order_type,
+            demo_mode=args.demo,
+        )
+        if args.out:
+            out = Path(args.out)
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(json.dumps(result, indent=2, ensure_ascii=False, default=str) + "\n", encoding="utf-8")
+        if args.json:
+            print(json.dumps(result, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(format_scan_table(result))
+        return 0
+    if args.cmd == "plan-trade":
+        import json
+        from piia.intelligence.trade_assistant import build_trade_plan
+        ticket = build_trade_plan(
+            symbol=args.symbol,
+            side=args.side,
+            equity_usdt=args.equity,
+            entry_price=args.entry,
+            stop_loss=args.stop,
+            take_profit=args.tp,
+            target_rr=args.rr,
+            leverage=args.leverage,
+            risk_pct=args.risk_pct,
+            order_type=args.order_type,
+            fetch_live_context=args.live,
+        )
+        print(json.dumps(ticket, indent=2, ensure_ascii=False, default=str))
+        return 0 if ticket.get("actionable_for_manual_review") else 2
+    if args.cmd == "position-advice":
+        import json
+        from piia.intelligence.trade_assistant import advise_open_position
+        advice = advise_open_position(
+            symbol=args.symbol,
+            side=args.side,
+            entry_price=args.entry,
+            qty=args.qty,
+            stop_loss=args.stop,
+            leverage=args.leverage,
+            mark_price=args.mark,
+            fetch_live=args.live,
+        )
+        print(json.dumps(advice, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.cmd == "agent-verify-freeze":
+        import json
+        from piia.intelligence.agent_v2.manifest import verify_piia_v2_frozen
+        res = verify_piia_v2_frozen()
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res["ok"] else 2
+    if args.cmd == "agent-run":
+        import json
+        from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH, run_prospective_cycle
+        db_p = Path(args.db) if args.db else DEFAULT_LEDGER_PATH
+        res = run_prospective_cycle(db_path=db_p, starting_cash=args.starting_cash, demo_mode=args.demo)
+        print(json.dumps(res, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.cmd == "agent-status":
+        import json
+        from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH, get_continuous_paper_status
+        db_p = Path(args.db) if args.db else DEFAULT_LEDGER_PATH
+        res = get_continuous_paper_status(db_path=db_p)
+        print(json.dumps(res, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.cmd == "agent-approve":
+        import json
+        from piia.intelligence.agent_v2.continuous_paper import DEFAULT_LEDGER_PATH, approve_human_proposal
+        db_p = Path(args.db) if args.db else DEFAULT_LEDGER_PATH
+        res = approve_human_proposal(
+            args.proposal_id, choice=args.choice, actor=args.actor, note=args.note, db_path=db_p
+        )
+        print(json.dumps(res, indent=2, ensure_ascii=False, default=str))
         return 0
     return 1
 

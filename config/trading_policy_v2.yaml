@@ -1,0 +1,63 @@
+# Owner-editable Trading Policy & Risk Profile v2 (Regime-Adaptive Decision Assistant).
+# Designed to assist manual and local paper trading across BTCUSDT, XAUUSDT, and NDX100USDT.
+# Live exchange order submission remains disabled by default; use generated Trade Tickets for manual execution.
+
+policy_id: regime_adaptive_v2
+version: "2.0.0"
+order_permissions: false
+
+risk:
+  default_equity_usdt: 500.0
+  risk_fraction_per_trade: 0.01
+  max_risk_fraction_cap: 0.03
+  default_leverage: 2.0
+  max_leverage_cap: 10.0
+  margin_mode: isolated
+  cash_floor: 0.20
+  max_margin_fraction: 0.50
+  max_open_positions: 1
+  slippage_each_side: 0.0005
+  daily_loss_halt_pct: 0.03
+  total_loss_halt_pct: 0.12
+  min_liquidation_buffer_pct: 0.015
+  min_reward_risk_ratio: 1.5
+  breakeven_trigger_r: 1.5
+  tp_ladder_r: [1.5, 2.5, 3.5]
+  max_book_slippage_bps: 15.0
+
+regime:
+  adx_period: 14
+  adx_range_below: 20.0
+  adx_trend_at_or_above: 22.0
+  atr_period: 14
+  atr_mean_period: 50
+  extreme_vol_atr_multiple: 2.2
+  htf_fast_ema: 20
+  htf_slow_ema: 50
+  h1_fast_ema: 20
+  h1_slow_ema: 50
+
+trend_leg:
+  donchian_entry_bars: 48
+  pullback_adx_min: 25.0
+  pullback_rsi_long_max: 55.0
+  pullback_rsi_short_min: 45.0
+  stop_atr_multiple: 2.0
+  chandelier_period: 22
+  chandelier_atr_multiple: 2.5
+  max_hold_hours: 96
+
+range_leg:
+  bollinger_period: 20
+  bollinger_std: 2.0
+  rsi_period: 14
+  rsi_oversold: 35.0
+  rsi_overbought: 65.0
+  max_atr_over_mean: 1.8
+  stop_atr_multiple: 1.8
+  max_hold_hours: 18
+
+allowed_symbols:
+  - BTCUSDT
+  - XAUUSDT
+  - NDX100USDT

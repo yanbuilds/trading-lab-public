@@ -1,6 +1,11 @@
 from __future__ import annotations
 from typing import Any, TypedDict
-from langgraph.graph import END, START, StateGraph
+try:
+    from langgraph.graph import END, START, StateGraph
+    _HAS_LANGGRAPH = True
+except ImportError:  # pragma: no cover - fallback when langgraph is not installed
+    END = START = StateGraph = None  # type: ignore[assignment]
+    _HAS_LANGGRAPH = False
 from piia.intelligence.agents.io import RoleOutput, WorkflowResult
 from piia.intelligence.agents.providers import (
     PROMPT_HASH, FixtureProvider, OfficialAPIProvider, injection_flags,
@@ -23,7 +28,20 @@ def _node(role: str):
         return {role: out.model_dump()}
     return run
 
+class _SequentialGraph:
+    def __init__(self, steps):
+        self._steps = steps
+
+    def invoke(self, state: GraphState) -> GraphState:
+        current: dict = dict(state)
+        for step in self._steps:
+            current.update(step(current))
+        return current  # type: ignore[return-value]
+
+
 def build_graph():
+    if not _HAS_LANGGRAPH:
+        return _SequentialGraph((_node("researcher"), _node("critic"), _node("synthesizer")))
     g = StateGraph(GraphState)
     g.add_node("researcher", _node("researcher"))
     g.add_node("critic", _node("critic"))

@@ -36,7 +36,7 @@ jobs:
         shell: pwsh
         run: |
           $files = (Get-ChildItem tests/test_piia*.py).FullName
-          python -m pytest $files tests/test_liquidity_positioning.py tests/test_research_cycle.py tests/test_chat_decision_gate.py tests/test_current_external_evidence.py tests/test_manual_observation.py tests/test_event_calendar_and_gold.py tests/test_public_research_feeds.py tests/test_polymarket.py tests/test_onchain_integrity.py tests/test_alfred_macro_data.py tests/test_position_tiers_and_margin.py tests/test_research_fusion.py
+          python -m pytest $files tests/test_trading_assistant_v2.py tests/test_liquidity_positioning.py tests/test_research_cycle.py tests/test_chat_decision_gate.py tests/test_current_external_evidence.py tests/test_manual_observation.py tests/test_event_calendar_and_gold.py tests/test_public_research_feeds.py tests/test_polymarket.py tests/test_onchain_integrity.py tests/test_alfred_macro_data.py tests/test_position_tiers_and_margin.py tests/test_research_fusion.py tests/test_ai_shadow.py tests/test_ai_shadow_source_audit.py tests/test_execution_revalidate.py tests/test_forward_archive.py tests/test_official_provider_anthropic.py tests/test_position_scenarios.py
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test legacy UTC execution and settlement
         run: >-
@@ -68,7 +68,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Test risk and prospective comparisons
         run: >-
-          python -m pytest tests/test_perps.py tests/test_perps_compare.py
+          python -m pytest tests/test_piia_agent_v2.py tests/test_trading_assistant_v2.py
+          tests/test_perps.py tests/test_perps_compare.py
+          tests/test_aligned_candidate.py tests/test_regime_mean_reversion.py
+          tests/test_breakout_candidate.py tests/test_cross_market_breakout.py
+          tests/test_contract_feasibility.py tests/test_portfolio_cost_stress.py
+          tests/test_policy_latency_stress.py
           tests/test_frozen_policy_capture.py tests/test_prospective_paper_report.py
           tests/test_funding_segment_comparison.py tests/test_segmented_forward_v2.py
           tests/test_forecast_baseline_report.py tests/test_chronological_segments.py

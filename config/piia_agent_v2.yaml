@@ -1,0 +1,104 @@
+# Pre-registered Personal Investment Intelligence Agent (PIIA v2) Frozen Policy.
+# Locked BEFORE fetching or evaluating post-2026-11-16 out-of-sample market data.
+# Any change to decision thresholds, cost assumptions, or risk gates requires a new version (v3).
+
+protocol_id: PIIA_PERSONAL_INVESTMENT_INTELLIGENCE_AGENT_V2
+version: "2.0.0"
+precommitted_before_post_2026_11_16_holdout: true
+tuning_on_holdout_forbidden: true
+retain_negative_and_null_results: true
+live_order_permissions: false
+exchange_demo_order_permissions: false
+
+universe:
+  venue: bitget
+  product_type: USDT-FUTURES
+  margin_mode: isolated
+  symbols:
+    - BTCUSDT
+    - XAUUSDT
+    - NDX100USDT
+
+books:
+  primary_100u:
+    starting_cash_usdt: 100.0
+    note: Strict continuity with v1 100 USDT single-position research constraint; XAUUSDT min lot (0.01) may be rejected when 2*ATR stop exceeds 1 USDT budget.
+  retail_500u:
+    starting_cash_usdt: 500.0
+    note: Separate never-mixed 500 USDT book allowing XAUUSDT 0.01 min lot to be evaluated under identical 1% risk rules.
+
+risk_and_costs:
+  leverage: 2.0
+  risk_fraction_per_trade: 0.01
+  cash_floor_fraction: 0.20
+  max_margin_fraction: 0.50
+  max_open_positions: 1
+  taker_fee_fallback: 0.0006
+  maker_fee_fallback: 0.0002
+  slippage_each_side_base: 0.0005
+  slippage_each_side_stress_multiplier: 2.0
+  daily_loss_halt_fraction: 0.03
+  total_loss_halt_fraction: 0.10
+  min_stop_to_liquidation_buffer_pct: 0.015
+  funding_reserve_intervals: 1
+
+evidence_pillars:
+  market:
+    timeframe_primary: 1H_closed
+    timeframes_context: [4H_completed, 1D_utc_completed]
+    adx_period: 14
+    adx_range_max: 20.0
+    adx_trend_min: 22.0
+    adx_pullback_min: 25.0
+    atr_period: 14
+    atr_mean_period: 50
+    extreme_vol_atr_ratio: 2.2
+    range_max_atr_ratio: 1.8
+    ema_fast: 20
+    ema_slow: 50
+    donchian_breakout_bars: 48
+    chandelier_period: 22
+    chandelier_atr_mult: 2.5
+    bollinger_period: 20
+    bollinger_std: 2.0
+    rsi_period: 14
+    rsi_oversold: 35.0
+    rsi_overbought: 65.0
+  macro:
+    series_required_live: [DGS10, DGS2, DFII10, DFF, DTWEXBGS, RRPONTSYD, WDTGAL]
+    point_in_time_daily_lag_utc_days: 2
+    lookback_trading_obs: 5
+    real_yield_headwind_delta_pct: 0.12
+    broad_dollar_headwind_change_pct: 0.80
+    event_risk_block_hours_ahead: 2.0
+  flows_and_positioning:
+    btc_etf_lookback_days: 3
+    btc_etf_outflow_caution_musd: -150.0
+    gold_cot_context_only: true
+    block_long_on_deleveraging_state: true
+  onchain:
+    btc_max_tip_age_hours: 3.0
+    fee_spike_caution_sat_vb: 80.0
+  polymarket:
+    max_book_age_minutes: 5.0
+    max_spread_prob: 0.05
+    odds_are_uncalibrated_context: true
+  forecast:
+    horizon_hours: 24
+    benchmark_lookback_hours: 168
+    opposing_move_veto_atr_mult: 0.75
+    wide_uncertainty_q90_q10_atr_mult: 8.0
+
+roles_and_gates:
+  critic_max_friction_share_of_1r: 0.25
+  critic_max_adverse_funding_8h: 0.0003
+  breakeven_ratchet_r: 1.5
+  trend_stop_atr_mult: 2.0
+  trend_max_hold_hours: 72
+  range_stop_atr_mult: 1.8
+  range_max_hold_hours: 18
+
+evaluation_splits:
+  exploratory_end_exclusive_utc: "2026-11-16T06:00:00+00:00"
+  unseen_holdout_start_utc: "2026-11-16T06:00:00+00:00"
+  warmup_bars_required: 300

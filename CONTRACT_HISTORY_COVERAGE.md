@@ -20,7 +20,7 @@
 
 ```powershell
 $env:PYTHONPATH = 'src'
-$marketDataDir = '..\https-github-com-yanbuilds-trading-lab\data\perps-extended'
+$marketDataDir = 'data\perps-extended'
 ..\freqtrade-env\Scripts\python.exe -m experiments.portfolio_cost_stress --data-dir $marketDataDir --start '2026-08-19T00:00:00Z' --end '2026-11-16T06:00:00Z' --out artifacts\three_contract_reproduction.json
 ```
 

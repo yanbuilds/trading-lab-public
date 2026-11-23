@@ -1,3 +1,63 @@
+# Personal Investment Intelligence Agent (PIIA v2) & 交易辅助平台
+
+面向个人投资者的 **Personal Investment Intelligence Agent（PIIA v2）** 与多周期交易辅助研究平台，优先覆盖 **Bitget USDT 永续合约：比特币（`BTCUSDT`）、黄金（`XAUUSDT`）与纳指 100（`NDX100USDT`）**。
+
+> **研究使命与红线**：目标不是堆叠数据源与 Agent，而是严格检验该系统能否在**完整手续费、滑点、资金费与强平风控约束**下，比简单基线策略提供更优的风险调整决策。全流程遵循：**先冻结规则并锁定源码 SHA-256 → 无前视偏差的样本外检验与渐进式模块对照 → 持续追加式纸面交易**；如实保留全部亏损与负向结果，**绝不为盈利回调参数，绝不保存私钥，绝不自动实盘下单**（原冻结策略 [FROZEN_POLICY_V1.md](FROZEN_POLICY_V1.md) 亦 100% 原样保留）。
+
+---
+
+## 核心架构与验证闭环（PIIA v2）
+
+详见预注册冻结协议 [PIIA_V2_PROTOCOL.md](PIIA_V2_PROTOCOL.md) 与真实数据样本外检验报告 [PIIA_V2_EVALUATION_REPORT.md](PIIA_V2_EVALUATION_REPORT.md)：
+
+1. **六大公开证据支柱融合（`src/piia/intelligence/agent_v2/pillars.py`）**
+   - **行情与微观结构**：闭合 `1h/4h/1d` K 线、因果指标、实时双边盘口可见深度、逐仓维持保证金档位、公开资金费率与持仓量（OI）。
+   - **宏观与官方日历**：ALFRED 10Y 实际利率（`DFII10`）、名义美债（`DGS10` / `DGS2`）、广义美元指数（`DTWEXBGS`）与高危通胀预期（`T5YIFR`），严格施加发布滞后门控（历史回放对日频序列保守延迟 `+2` 自然日），叠加美联储 / BLS / BEA 官方日程。
+   - **资金流与仓位结构**：美国现货 BTC ETF 净流入（Farside / TFTC 双源核验）、COMEX 黄金 COT 管理基金净头寸（按周五 20:30 UTC CFTC 发布门控）、跨市场流动性脆弱性评估。
+   - **链上状态**：`mempool.space` 区块高度、未确认池拥堵与推荐费率压力。
+   - **预测市场赔率**：Polymarket（Gamma + CLOB）宏观与加密事件实时双边盘口隐含概率（剔除过期/单边/交叉盘口，不冒充校准概率）。
+   - **预测模型与统计基准**：优先绑定本地隔离缓存 Chronos 分位数预测，未安装权重时自动回退至诚实标注的 `168h` 因果漂移—波动率不确定性区间基准（`statistical_drift_vol_168h`）。
+2. **上下文隔离角色审查与确定性程序化风控（`roles.py` / `risk_gate.py`）**
+   - **独立研究方（`Researcher`）** 与 **首轮独立反方（`Critic Pass 1`）** 接收同一冻结证据快照，代码级强制断言互不可见对方输出；随后 **对抗审查（`Critic Pass 2`）** 针对研究方提案逐条核查成本拖累（`2.2 * ATR < 3.5 * 往返成本`）、资金费拥挤、宏观逆风、预测区间过宽与链上/盘口摩擦；**综合角色（`Synthesizer`）** 汇总双方并完整保留分歧记录（`disagreements`），可选接入白名单官方大模型文本复核（`research-cycle`，仍声明 `independent_llm_review = "NOT_WIRED"`，无权推翻程序门控）。
+   - **程序化确定性风控门控（`ProgrammaticRiskGate`）**：计算向下取整合约张数、单笔止损预算上限（`1.0%` 权益）、含双边手续费保本价、`+1.5R` 推保本、`22` 周期吊灯跟踪止损、`48h` 时间止损、估算逐仓强平缓冲（止损前至少保留 `35%` 清算缓冲）与累计亏损 `-10%` 账户熔断，输出唯一可追溯 `decision_id` 的 **做多（`long`）/ 做空（`short`）/ 观望（`stand_aside`）** 决策。
+3. **样本外与模块消融实证结论摘要（如实披露，零调参）**
+   - 在冻结清单哈希（`manifest_sha256 = 17b31673...`）后对 Bitget 三合约 2,208 根连续真实 `1h` K 线与完整历史资金费做一次性检验（前缀截断无前视检验 3 个切点闭合交易 **100% 逐笔一致**）：
+     - **冻结后未见样本外窗口（`2026-11-16 06:00Z → 2026-11-22 23:00Z`，162 小时）**：`M4_full_piia_v2` 净收益 `+0.603%`（100U）/ `+0.555%`（500U，MaxDD `2.38%`），优于未加反方审查的纯研究信号 `M1`（`-0.089%` / `-0.057%`）、`B4_v1_range_bollinger`（`+0.255%` / `+0.273%`）与现金 `B0`（`0.00%`）；**但显著跑输仅交易 1 笔的低换手 `B2_aligned_ema_4h`（`+2.460%` / `+2.549%`）与 `B3_donchian_breakout_4h`（`+1.848%` / `+2.122%`）**，且在 `2x` 双倍滑点压力下因 10 笔换手转为 `-1.240%`。
+     - **冻结前 73 天震荡探索窗口（`2026-09-04 → 2026-11-16 05:00Z`，1,746 小时）**：简单基线 `B1`、`B3`、`B4` 与无反方门控 `M1`（`-10.55%`，73 笔）全部触发 `-10%` 停机熔断；`M4_full_piia_v2` 借助反方 **145 次成本拖累否决** 将亏损与手续费压缩超一半（100U `-4.92%` / 500U `-4.82%`，MaxDD `7.85%`，未触发熔断），但仍跑输空仓现金 `B0`（`0.00%`），且滞后日频宏观（`M2`）与统计漂移预测（`M3`）在该区间内增量贡献极小。
+4. **持续前瞻纸面交易双账本（`continuous_paper.py`）**
+   - 追加式 SQLite 账本（`UPDATE/DELETE` 触发器锁死），同步维护自动影子对照账本（`M4_full_piia_v2` vs `B1` / `B3` / `B0_cash`）与需人工显式审批的纸面提案账本（`human_approved_paper`）。
+5. **🎯 个人交易辅助工具箱（`scan` / `plan-trade` / `position-advice`）**
+   - 提供三大合约实时盘面雷达、下单前精确张数/含费保本价/`TP1–TP3` 分批止盈阶梯/强平缓冲工单计算器，以及盘中移动止损诊断顾问。
+
+## 快速上手命令
+
+```powershell
+$env:PYTHONPATH = "src;."
+
+# 1. 核验 PIIA v2 预注册冻结规则与源码 SHA-256 完整性
+python -m piia agent-verify-freeze
+
+# 2. 执行本小时真实六支柱采集、独立研究+反方审查+确定性风控，并写入持续纸面交易账本（离线演示加 --demo）
+python -m piia agent-run --starting-cash 500
+python -m piia agent-status
+
+# 3. 人工审批或驳回待决纸面提案（仅记录本地纸面账本，绝不触发交易所下单）
+python -m piia agent-approve --proposal-id <PROPOSAL_ID> --choice approve --actor investor --note "manual-check"
+
+# 4. 复现无前视样本外检验与 9 组基线/模块消融对照实验（离线合成检验用 --demo-synthetic，拉取公开行情用 --fetch-public）
+python -m experiments.run_piia_v2_oos_ablation --demo-synthetic
+
+# 5. 日常交易辅助命令：盘面扫描 / 下单前风控工单 / 持仓移动止损顾问
+python -m piia scan --equity 500 --leverage 2 --risk-pct 1.0
+python -m piia plan-trade --symbol BTCUSDT --side long --equity 500 --entry 64500 --stop 63200 --tp 67800 --leverage 3 --risk-pct 1.0
+python -m piia position-advice --symbol BTCUSDT --side long --entry 64500 --qty 0.03 --stop 63200 --leverage 3 --mark 66600
+
+# 6. 启动本地可视化工作台 Web UI（含「🧠 PIIA v2 智能体与消融审计」与「🎯 交易辅助工作台」）
+python -m streamlit run app\piia_app.py --server.address 127.0.0.1 --server.port 8793
+```
+
+---
+
 # PIIA 第一阶段（观点审计，2026-11-16）
 
 前瞻资金费只读记录：[协议](FUNDING_OBSERVER_V1.md)。政策生效后，每次完成机械小时观察，可在同一小时手动运行 `..\freqtrade-env\Scripts\python.exe -m experiments.funding_observer`；三合约的官方当前费率、周期、下次更新时间、原始响应和采集时间会附加到本地账本。每小时只允许一次尝试，失败不会补零。累计连续记录后，可运行 `..\freqtrade-env\Scripts\python.exe -m experiments.prospective_funding_realization`，只读获取 Bitget 官方历史费率，核对页面稳定性、原文、期间、事前周期与下一次更新时间后，对相同候选及可用影子账户生成本地估算。`nextUpdate` 是费率更新时间，不保证是结算时间；小时开盘只是标记价代理，账户实际资金费、费率、真实成交与强平均未核验，因此估算不是真实或经验证净收益。缺失一小时、周期改变或记录不匹配时拒绝；不需要或使用交易所账户密钥。
@@ -46,7 +106,7 @@ Polymarket 实时研究样本分别记录采集开始、单个事件及盘口接
 
 冻结研究候选及样本纪律见 [FROZEN_POLICY_V1.md](FROZEN_POLICY_V1.md)：本版是可复现的机械震荡策略，AI / 宏观 / 预测只作研究背景，并未证明能改善进出场。已看过的历史数据不作为留出集；没有足够前瞻数据时结论是证据不足。策略清单的结构化内容和关键参数必须匹配冻结值，变更规则需要新版本。
 
-可对本地缓存只读检查完整年度与预热期，例如 `..\freqtrade-env\Scripts\python.exe -m experiments.history_coverage_audit --data-dir ..\https-github-com-yanbuilds-trading-lab\data\perps-extended --start 2025-11-16T06:00:00Z --end 2026-11-16T06:00:00Z`。报告列出每个合约 K 线和按缓存记录周期假设的资金费缺口、文件哈希；不下载或生成行情，也不计算收益。缓存周期不证明历史结算周期，覆盖完整亦不证明数据真实、样本外或净收益可用。
+可对本地缓存只读检查完整年度与预热期，例如 `..\freqtrade-env\Scripts\python.exe -m experiments.history_coverage_audit --data-dir data\perps-extended --start 2025-11-16T06:00:00Z --end 2026-11-16T06:00:00Z`。报告列出每个合约 K 线和按缓存记录周期假设的资金费缺口、文件哈希；不下载或生成行情，也不计算收益。缓存周期不证明历史结算周期，覆盖完整亦不证明数据真实、样本外或净收益可用。
 
 如果另有 BTC 行情文件，可用 `--btc-bars <文件路径>` 单独检查；这个文件的来源不由共享缓存的元数据证明。2026-11-17 对本地独立 `BTCUSDT-year.csv` 的核查显示，它覆盖上述一年及 300 小时预热，但不补足资金费，也不补足黄金与纳指数据；该区间已看过，不是留出集。[Bitget 统一账户历史资金费官方文档](https://www.bitget.com/docs/catalog/market/derivatives)说明接口为最近 90 天。2026-11-17 只读抽查经典接口更深页面，BTC 与纳指第 5、10、15 页以及黄金第 10、15 页均为空；这只是当次可用性观察，不证明更早数据不存在或第三方数据可靠。
 
@@ -88,7 +148,7 @@ BTC 已查看历史区间的 300 根滚动窗口诊断、输入哈希和逐步�
 
 执行延迟敏感性研究：在已查看的 2026-08-19 至 2026-11-16 06:00 UTC（终点不含）三合约数据上，100 USDT 共享单仓、手续费和滑点照旧、按用户要求不计资金费时，原规则的下一开盘假设结果为 -10.27%（37 笔平仓），额外等待一小时再执行入场和中轨退出信号为 -10.14%（48 笔平仓，最大回撤 10.77%）。两种仓位路径不同，不能把差异当作单纯执行成本，也不应因历史收益挑选延迟；两者都不是留出测试或净收益。额外延迟仅为压力情景，不修改冻结 v1；止损、到期退出、开盘价成交和强平仍是简化假设。可用 `..\freqtrade-env\Scripts\python.exe -m experiments.policy_latency_stress --data-dir <本地perps-extended目录> --start 2026-08-19T00:00:00Z --end 2026-11-16T06:00:00Z` 复现，报告不提交。
 
-后续接手（含 Codex）请先读仓库根目录的 [CODEX_HANDOFF.md](CODEX_HANDOFF.md)：已完成、未完成、验证限制与建议顺序。当前功能分支尚未合并到 `main`，只读 `main` 会漏掉研究链路改动。
+后续开发与接手请先阅读仓库根目录的 [AGENTS.md](AGENTS.md) 与 [RESEARCH_INTEGRATION.md](RESEARCH_INTEGRATION.md)：了解模块边界、冻结策略约束与依赖许可说明。
 
 ## 流动性与仓位研究（未验证，不下单）
 
@@ -455,7 +515,7 @@ $env:PYTHONPATH='src;.'
 
 同一固定突破候选在已查看 BTC 永续行情中的 2023 年、2024 年价格诊断分别为 +13.73%（最大回撤 5.62%，15 笔已平仓）及 +6.28%（最大回撤 4.21%，16 笔已平仓、1 笔未平仓）。新增加入/退出费用和滑点的 1 倍做多持有参考，在 2023、2024、2026 年初至 11 月 16 日分别约 +154.16%、+117.58%、-25.68%；持有参考的风险暴露、现金约束与策略不同且假设期末全部平仓，策略期末未平仓仍按收盘估值，不能视为风险匹配比较。资金费均未知，历史规格和强平未验证，三个区间均已查看。可通过相同实验命令的 `--bars` 选择 `BTCUSDT-2023.csv` 或 `BTCUSDT-2024.csv` 并指定完整对应年份的 UTC 起止，所有结果不得解读为样本外表现。
 
-固定的震荡候选也可对同一组已查看 BTC 年份做独立探索性价格诊断：`..\freqtrade-env\Scripts\python.exe -m experiments.btc_frozen_policy_history_check --data-dir ..\https-github-com-yanbuilds-trading-lab\data\perps-extended`。三个窗口及候选/EMA 规则固定，每个窗口各自从 100 USDT 开始；资金费未知且不计入，不能称为净收益或留出验证，也不代表三合约组合。完整预热与逐小时仅使用最近 300 根的前瞻采集口径不同，真实成交、历史规格和强平均未核验。
+固定的震荡候选也可对同一组已查看 BTC 年份做独立探索性价格诊断：`..\freqtrade-env\Scripts\python.exe -m experiments.btc_frozen_policy_history_check --data-dir data\perps-extended`。三个窗口及候选/EMA 规则固定，每个窗口各自从 100 USDT 开始；资金费未知且不计入，不能称为净收益或留出验证，也不代表三合约组合。完整预热与逐小时仅使用最近 300 根的前瞻采集口径不同，真实成交、历史规格和强平均未核验。
 
 上述 BTC 单品种探索性诊断：2023、2024 和 2026 年初至 11 月 16 日的震荡候选价格模拟分别约为 -8.76%、-3.08%、-10.25%，最大回撤约 8.76%、3.31%、11.16%，已平仓 48、13、125 笔，均触发停机；EMA 同条件分别约 +44.11%、+2.82%、+13.95%。已计假设手续费和滑点，**资金费未知且排除**，两个策略的市场暴露不同，不能称为风险匹配比较。2026 窗口未满全年；这些数据均已查看，结果不证明样本外表现，也不为此调整已冻结规则。三段结果均不支持将该震荡候选认作已验证盈利策略。
 

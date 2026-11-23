@@ -23,7 +23,7 @@ py -3.13 -m venv ..\btc-repro-env
 ..\btc-repro-env\Scripts\python.exe -m pip install -r requirements-perps.lock
 ..\btc-repro-env\Scripts\python.exe -m pip install -e . --no-deps
 $env:PYTHONPATH = 'src'
-$marketDataDir = '..\https-github-com-yanbuilds-trading-lab\data\perps-extended'
+$marketDataDir = 'data\perps-extended'
 ..\btc-repro-env\Scripts\python.exe -m experiments.btc_frozen_policy_history_check --data-dir $marketDataDir --out artifacts\btc_history_verify_chain.json
 ..\btc-repro-env\Scripts\python.exe -m experiments.btc_rolling_window_replay --data-dir $marketDataDir --reference artifacts\btc_history_verify_chain.json --out artifacts\btc_rolling_candidate_verification.json
 ..\btc-repro-env\Scripts\python.exe -m experiments.btc_rolling_ema_comparison --data-dir $marketDataDir --candidate-reference artifacts\btc_rolling_candidate_verification.json --out artifacts\btc_comparison_reproduced.json

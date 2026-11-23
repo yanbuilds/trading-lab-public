@@ -1,21 +1,21 @@
 [project]
 name = "trading-lab"
-version = "0.1.0"
-description = "BTC / GLD / QQQ research backtest and latest-signal replay (not live trading)"
+version = "0.2.0"
+description = "Multi-regime trading decision assistant, risk ticket calculator, walk-forward backtester, and research audit lab (no live order routing)"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-  "vectorbt==1.2.1",
-  "streamlit",
+  "numpy",
   "pandas",
   "pyyaml",
-  "yfinance",
-  "pandas-market-calendars",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
-piia = ["fastapi", "uvicorn[standard]", "pydantic", "sqlalchemy", "alembic", "httpx", "python-multipart", "streamlit"]
+etf = ["vectorbt==1.2.1", "streamlit", "yfinance", "pandas-market-calendars"]
+perps = ["ccxt", "TA-Lib", "httpx"]
+piia = ["fastapi", "uvicorn[standard]", "pydantic", "sqlalchemy", "alembic", "httpx", "python-multipart", "streamlit", "altair", "langgraph"]
+forecast = ["chronos-forecasting"]
 
 [project.scripts]
 trading-lab = "trading_lab.cli:main"

@@ -52,7 +52,386 @@ def service() -> IntelligenceService:
 svc = service()
 try:
     instruments = {i.id: i.display_name for i in svc.list_instruments()}
-    tab_chat, tab_scenario, tab_create, tab_view, tab_risk, tab_eval, tab_research, tab_paper = st.tabs(["聊天辅助研究", "仓位风险情景", "Create thesis", "Revisions & countercase", "Sample risk / plan", "Outcome", "Research run", "Paper account"])
+    tab_agent_v2, tab_assistant, tab_chat, tab_scenario, tab_create, tab_view, tab_risk, tab_eval, tab_research, tab_paper = st.tabs([
+        "🧠 PIIA v2 智能体与消融审计",
+        "🎯 交易辅助工作台 (v2)",
+        "聊天辅助研究",
+        "仓位风险情景",
+        "Create thesis",
+        "Revisions & countercase",
+        "Sample risk / plan",
+        "Outcome",
+        "Research run",
+        "Paper account",
+    ])
+
+    with tab_agent_v2:
+        import json as _ag2_json
+        from pathlib import Path as _Ag2Path
+        import pandas as _ag2_pd
+        from piia.intelligence.agent_v2.continuous_paper import (
+            approve_human_proposal,
+            get_continuous_paper_status,
+            run_prospective_cycle,
+        )
+        from piia.intelligence.agent_v2.manifest import verify_piia_v2_frozen
+        from piia.intelligence.paths import ROOT as _AG2_ROOT
+
+        st.subheader("🧠 Personal Investment Intelligence Agent (PIIA v2)")
+        st.caption(
+            "面向个人投资者的跨市场可追溯决策与反堆砌验证系统：优先覆盖 Bitget BTCUSDT、XAUUSDT、NDX100USDT 永续合约；"
+            "融合行情、宏观(ALFRED/日历)、资金流(ETF/COT/脆弱度)、链上(mempool)、Polymarket与预测模型；"
+            "经独立研究、反方审查与确定性风控形成可审计的做多/做空/观望决策。先冻结规则完成样本外与模块消融检验，再持续纸面交易，绝不自动实盘下单。"
+        )
+        fz = verify_piia_v2_frozen()
+        if fz["ok"]:
+            st.success(f"🔒 规则与源码预注册冻结校验通过 (`manifest_sha256={fz['manifest_sha256'][:16]}...`) — 未发生事后篡改或调参。")
+        else:
+            st.error(f"🚨 冻结校验未通过：{fz['issues']} — 持续前瞻纸面与样本外声明已自动阻断。")
+
+        with st.expander("📊 样本外留出集 (Post-2026-11-16) 与模块消融对照报告", expanded=True):
+            oos_path = _AG2_ROOT / "artifacts" / "piia_v2_oos_ablation.json"
+            if not oos_path.is_file():
+                st.info("尚未在本地生成 `artifacts/piia_v2_oos_ablation.json`；可运行 `python -m experiments.run_piia_v2_oos_ablation --fetch-public`。")
+            else:
+                try:
+                    oos_doc = _ag2_json.loads(oos_path.read_text(encoding="utf-8"))
+                    la_ok = (oos_doc.get("prefix_truncation_lookahead_audit") or {}).get("ok")
+                    st.caption(
+                        f"评估生成时间 UTC: {oos_doc.get('evaluated_at_utc')} | 数据集哈希: `{str(oos_doc.get('dataset_sha256'))[:16]}...` | "
+                        f"前缀截断无前视检验: `{'PASS' if la_ok else 'UNVERIFIED'}` | 冻结后调参: `{oos_doc.get('tuning_performed_after_freeze')}`"
+                    )
+                    win_sel = st.selectbox(
+                        "选择评估窗口",
+                        list((oos_doc.get("windows") or {}).keys()),
+                        key="ag2_win_sel",
+                    )
+                    book_sel = st.selectbox("选择独立本金账本", ["book_100u", "book_500u"], index=1, key="ag2_book_sel")
+                    win_obj = ((oos_doc.get("windows") or {}).get(win_sel) or {}).get(book_sel) or {}
+                    base_res = win_obj.get("base_cost_results") or {}
+                    stress_res = win_obj.get("stress_2x_slippage_results") or {}
+                    if base_res:
+                        tbl = []
+                        for arm_k, item in base_res.items():
+                            st_item = stress_res.get(arm_k) or {}
+                            tbl.append({
+                                "实验臂 (基线 / 消融)": arm_k,
+                                "期末权益(U)": item.get("final_usdt"),
+                                "净收益率(%)": item.get("return_pct"),
+                                "最大回撤(%)": item.get("max_drawdown_pct"),
+                                "2x滑点压力收益(%)": st_item.get("return_pct"),
+                                "平仓笔数": item.get("closed_trades"),
+                                "胜率(%)": item.get("winrate_pct"),
+                                "手续费(U)": item.get("fees_paid_usdt"),
+                                "资金费净支出(U)": item.get("funding_net_paid_usdt"),
+                                "持仓时间占比": item.get("exposure_bar_fraction"),
+                                "触发停机": item.get("loss_halt_triggered"),
+                            })
+                        st.dataframe(_ag2_pd.DataFrame(tbl), width="stretch")
+                except Exception as exc:
+                    st.warning(f"读取样本外消融报告异常：{exc}")
+
+        st.divider()
+        st.subheader("⏱️ 持续前瞻纸面交易与可追溯决策账本 (Append-Only SQLite)")
+        ag_c1, ag_c2, ag_c3 = st.columns(3)
+        ag_cash = ag_c1.number_input("初始模拟本金 (USDT)", min_value=50.0, max_value=1_000_000.0, value=500.0, step=50.0, key="ag2_start_cash")
+        if ag_c2.button("🚀 运行本小时全证据前瞻周期 (实时公开源)", key="ag2_btn_live_cycle"):
+            try:
+                with st.spinner("正在核验冻结清单并采集六大公开证据支柱（行情/盘口/档位/宏观/ETF/COT/链上/Polymarket/预测）..."):
+                    st.session_state["ag2_last_cycle"] = run_prospective_cycle(starting_cash=float(ag_cash), demo_mode=False)
+            except Exception as exc:
+                st.error(f"实时前瞻周期运行失败：{exc}")
+        if ag_c3.button("🧪 运行合成演示前瞻周期 (离线)", key="ag2_btn_demo_cycle"):
+            try:
+                st.session_state["ag2_last_cycle"] = run_prospective_cycle(starting_cash=float(ag_cash), demo_mode=True)
+            except Exception as exc:
+                st.error(f"离线演示周期运行失败：{exc}")
+
+        if st.session_state.get("ag2_last_cycle"):
+            st.json(st.session_state["ag2_last_cycle"])
+
+        cp_status = get_continuous_paper_status()
+        if not cp_status.get("initialized"):
+            st.info("本地持续纸面账本 (`data/piia/piia_v2_continuous.sqlite`) 尚无记录；点击上方按钮即可记录首个可追溯周期。")
+        else:
+            st.caption(
+                f"已累计记录前瞻周期数: **{cp_status['cycles_recorded']}** | 首周期: `{cp_status['first_cutoff_utc']}` | "
+                f"最新周期: `{cp_status['latest_cutoff_utc']}` (`{cp_status['latest_mode']}`)"
+            )
+            b_rows = []
+            for b_k, b_v in (cp_status.get("books") or {}).items():
+                op = b_v.get("open_position")
+                b_rows.append({
+                    "对照账本": b_k,
+                    "初始资金(U)": b_v["starting_cash_usdt"],
+                    "当前现金(U)": b_v["cash_usdt"],
+                    "已平仓笔数": b_v["closed_trades"],
+                    "已实现净损益(U)": b_v["realized_net_pnl_usdt"],
+                    "当前持仓": f"{op['symbol']} {op['side']} {op['qty']}@{op['entry']:.2f} (SL={op['stop']:.2f})" if op else "空仓",
+                })
+            st.dataframe(_ag2_pd.DataFrame(b_rows), width="stretch")
+
+            for tr_d in cp_status.get("latest_decisions") or []:
+                with st.expander(
+                    f"🧾 最新追溯决策 · {tr_d['symbol']} -> {tr_d['final_action'].upper()} "
+                    f"(状态={tr_d['regime']}, 原因={tr_d.get('stand_aside_reason') or 'passed_all_gates'})"
+                ):
+                    st.write("保留的角色分歧 (Disagreements):", tr_d.get("disagreements") or ["无分歧"])
+                    st.json({
+                        "entry_plan": tr_d.get("entry_plan"),
+                        "exit_plan": tr_d.get("exit_plan"),
+                        "position_sizing": tr_d.get("position_sizing"),
+                        "cost_and_risk": tr_d.get("cost_and_risk"),
+                        "trace_hash": tr_d.get("trace_hash"),
+                    })
+
+            pending_props = cp_status.get("pending_human_proposals") or []
+            if pending_props:
+                st.subheader("✍️ 待人工审批的模拟交易提案 (永不自动下单)")
+                prop_ids = [p["proposal_id"] for p in pending_props]
+                sel_pid = st.selectbox("选择待审批提案 ID", prop_ids, key="ag2_sel_pid")
+                sel_choice = st.selectbox("人工决定", ["approve", "reject"], key="ag2_sel_choice")
+                sel_note = st.text_input("审批备注", "", key="ag2_sel_note")
+                if st.button("提交人工纸面审批决定", key="ag2_btn_approve"):
+                    try:
+                        dec_out = approve_human_proposal(sel_pid, choice=sel_choice, note=sel_note)
+                        st.success(f"已完成人工纸面决策：{dec_out['choice']}")
+                        st.json(dec_out)
+                    except Exception as exc:
+                        st.error(f"审批失败：{exc}")
+
+    with tab_assistant:
+        import json as _ta_json
+        import pandas as _ta_pd
+        from piia.intelligence.trade_assistant import (
+            advise_open_position,
+            build_trade_plan,
+            scan_market_signals,
+        )
+
+        st.subheader("🎯 交易辅助工作台 (Regime-Adaptive v2)")
+        st.caption(
+            "整合三大合约多周期状态识别、自适应趋势/震荡信号扫描、含费保本价与止盈阶梯工单、盘口滑点与逐仓强平缓冲核验、以及持仓移动止损顾问。"
+            "仅作人工交易决策辅助与本地模拟盘推演，绝不读取私钥或自动向交易所发单。"
+        )
+        ta_c1, ta_c2, ta_c3, ta_c4 = st.columns(4)
+        ta_equity = ta_c1.number_input("计划账户权益 (USDT)", min_value=10.0, max_value=10_000_000.0, value=500.0, step=50.0, key="ta_equity")
+        ta_lev = ta_c2.number_input("计划逐仓杠杆 (x)", min_value=1.0, max_value=10.0, value=2.0, step=0.5, key="ta_lev")
+        ta_risk_pct = ta_c3.number_input("单笔最大风险预算 (%)", min_value=0.1, max_value=3.0, value=1.0, step=0.25, key="ta_risk_pct")
+        ta_order_type = ta_c4.selectbox("入场委托方式", ["limit", "market"], key="ta_order_type")
+
+        btn_col1, btn_col2 = st.columns(2)
+        if btn_col1.button("📡 实时扫描 Bitget 三大合约", key="ta_btn_live_scan"):
+            try:
+                with st.spinner("正在获取 Bitget 公开行情、闭合 K 线、盘口深度与仓位档位..."):
+                    st.session_state["ta_scan_result"] = scan_market_signals(
+                        equity_usdt=float(ta_equity),
+                        leverage=float(ta_lev),
+                        risk_fraction=float(ta_risk_pct) / 100.0,
+                        order_type=ta_order_type,
+                        demo_mode=False,
+                    )
+            except Exception as exc:
+                st.error(f"实时扫描失败：{exc}（若离线可点击右侧加载演示盘面）")
+        if btn_col2.button("🧪 加载离线演示盘面", key="ta_btn_demo_scan"):
+            st.session_state["ta_scan_result"] = scan_market_signals(
+                equity_usdt=float(ta_equity),
+                leverage=float(ta_lev),
+                risk_fraction=float(ta_risk_pct) / 100.0,
+                order_type=ta_order_type,
+                demo_mode=True,
+            )
+
+        scan_res = st.session_state.get("ta_scan_result")
+        if scan_res:
+            if scan_res.get("is_synthetic_demo"):
+                st.info("当前展示为显式标注的合成离线演示盘面（SYNTHETIC_DEMO_FIXTURE_NOT_LIVE），非实时市场报价。")
+            rows_overview = []
+            for sym_k, card in (scan_res.get("instruments") or {}).items():
+                an = card.get("analysis") or {}
+                tf = an.get("timeframes") or {}
+                ind = an.get("indicators") or {}
+                rows_overview.append({
+                    "合约": sym_k,
+                    "最新标记价": card.get("live_mark"),
+                    "24h涨跌(%)": an.get("return_24h_pct"),
+                    "1h/4h/1d趋势": f"{tf.get('1h', '?')} / {tf.get('4h', '?')} / {tf.get('1d', '?')}",
+                    "市场状态": an.get("regime"),
+                    "v2策略信号": an.get("signal"),
+                    "策略分支": an.get("leg"),
+                    "ADX14": ind.get("adx14"),
+                    "RSI14": ind.get("rsi14"),
+                    "ATR14(%)": ind.get("atr14_pct"),
+                    "年化资金费(%)": card.get("funding_annualized_pct"),
+                    "24h持仓量变化(%)": card.get("open_interest_change_24h_pct"),
+                })
+            st.dataframe(_ta_pd.DataFrame(rows_overview), width="stretch")
+            for sym_k, card in (scan_res.get("instruments") or {}).items():
+                an = card.get("analysis") or {}
+                with st.expander(f"📊 {sym_k} · 状态={an.get('regime')} · 信号={an.get('signal')} — {an.get('summary_cn', '')}", expanded=an.get("signal") in {"LONG", "SHORT"}):
+                    kl = an.get("key_levels") or {}
+                    st.write({
+                        "48h前高/前低": (kl.get("donchian_48h_high"), kl.get("donchian_48h_low")),
+                        "布林上/中/下轨": (kl.get("bb_upper"), kl.get("bb_mid"), kl.get("bb_lower")),
+                        "20日高低点": (kl.get("daily_20d_high"), kl.get("daily_20d_low")),
+                        "吊灯多/空跟踪止损": (kl.get("chandelier_long_stop"), kl.get("chandelier_short_stop")),
+                    })
+                    if card.get("trade_ticket"):
+                        st.caption("系统按当前风险预算自动测算的参考工单：")
+                        st.json(card["trade_ticket"])
+
+        st.divider()
+        st.subheader("🧮 下单前仓位、保本价与止盈阶梯计算器 (Trade Ticket)")
+        p1, p2, p3, p4, p5 = st.columns(5)
+        ta_sym = p1.selectbox("交易标的 (v2)", list(CONTRACTS), key="ta_plan_sym")
+        ta_side = p2.selectbox("建仓方向 (v2)", ["long", "short"], key="ta_plan_side")
+        default_px = float(((scan_res or {}).get("instruments") or {}).get(ta_sym, {}).get("live_mark") or SAMPLE_MARKS[ta_sym]["mark"])
+        ta_entry = p3.number_input("计划入场价 (v2)", min_value=0.0, value=default_px, format="%.4f", key="ta_plan_entry")
+        default_sl = round(default_px * (0.985 if ta_side == "long" else 1.015), 4)
+        ta_stop = p4.number_input("计划止损价 (v2)", min_value=0.0, value=default_sl, format="%.4f", key="ta_plan_stop")
+        ta_tp = p5.number_input("自定义止盈价 (0=默认2.5R)", min_value=0.0, value=0.0, format="%.4f", key="ta_plan_tp")
+        ta_live_book = st.checkbox("计算时联网拉取 Bitget 实时盘口深度与维持保证金档位", value=False, key="ta_plan_live_book")
+
+        if st.button("📐 生成交易工单与风控核对", key="ta_btn_calc_ticket"):
+            try:
+                ticket_out = build_trade_plan(
+                    symbol=ta_sym,
+                    side=ta_side,
+                    equity_usdt=float(ta_equity),
+                    entry_price=float(ta_entry) if ta_entry > 0 else None,
+                    stop_loss=float(ta_stop) if ta_stop > 0 else None,
+                    take_profit=float(ta_tp) if ta_tp > 0 else None,
+                    leverage=float(ta_lev),
+                    risk_pct=float(ta_risk_pct),
+                    order_type=ta_order_type,
+                    fetch_live_context=bool(ta_live_book),
+                )
+                st.session_state["ta_current_ticket"] = ticket_out
+            except ValueError as exc:
+                st.session_state.pop("ta_current_ticket", None)
+                st.error(f"工单计算错误：{exc}")
+            except Exception as exc:
+                st.session_state.pop("ta_current_ticket", None)
+                st.error(f"实时拉取或计算失败：{exc}")
+
+        cur_ticket = st.session_state.get("ta_current_ticket")
+        if cur_ticket:
+            verdict = cur_ticket.get("verdict")
+            if verdict == "READY_FOR_MANUAL_REVIEW":
+                st.success(f"工单核验状态：{verdict} — 符合风险预算与强平缓冲要求，可作人工复核参考。")
+            elif verdict == "CAUTION":
+                st.warning(f"工单核验状态：{verdict} — 存在风控提醒：{'；'.join(cur_ticket.get('warnings') or [])}")
+            else:
+                st.error(f"工单核验状态：{verdict} — 拒绝原因：{', '.join(cur_ticket.get('reasons') or [])}")
+
+            if cur_ticket.get("sizing") and cur_ticket.get("prices"):
+                m1, m2, m3, m4 = st.columns(4)
+                sz = cur_ticket["sizing"]
+                pr = cur_ticket["prices"]
+                rc = cur_ticket["risk_and_costs"]
+                m1.metric("建议下单张数", f"{sz['qty_contracts']:g}", f"名义 {sz['notional_usdt']:.2f} U")
+                m2.metric("预计止损亏损", f"-{rc['estimated_stop_loss_usdt']:.2f} U", f"占权益 {rc['estimated_stop_loss_pct_equity']:.2f}%")
+                m3.metric("含费保本价 (限价平仓)", f"{pr['breakeven_limit_exit']:.4f}", f"推保本触发价 {pr['move_stop_to_breakeven_trigger_price']:.4f}")
+                liq_str = f"{pr['estimated_isolated_liquidation']:.4f}" if pr.get("estimated_isolated_liquidation") else "N/A"
+                buf_str = f"缓冲 {pr['stop_to_liquidation_buffer_pct']:.2f}%" if pr.get("stop_to_liquidation_buffer_pct") is not None else ""
+                m4.metric("估算逐仓强平价", liq_str, buf_str)
+
+                if cur_ticket.get("take_profit_ladder"):
+                    st.caption("分批止盈与净盈亏比阶梯（已扣除开平仓手续费与预计入场滑点）：")
+                    ladder_rows = list(cur_ticket["take_profit_ladder"])
+                    if cur_ticket.get("take_profit_custom"):
+                        ladder_rows.insert(0, cur_ticket["take_profit_custom"])
+                    st.dataframe(_ta_pd.DataFrame(ladder_rows), width="stretch")
+
+                for item in cur_ticket.get("checklist") or []:
+                    prefix = "✅" if item.get("passed") else "❌"
+                    st.write(f"{prefix} **{item.get('item')}**：{item.get('detail')}")
+
+                if cur_ticket.get("actionable_for_manual_review") and float(ta_lev) <= 2.0:
+                    if st.button("📝 一键同步至本地模拟盘待批计划", key="ta_btn_sync_paper"):
+                        try:
+                            ext_ta = ExtendedService(svc)
+                            acc_id = st.session_state.get("account_id")
+                            if not acc_id:
+                                acc_obj = ext_ta.paper.open_account(starting_cash=float(ta_equity), label="TRADING_ASSISTANT_V2_SANDBOX")
+                                acc_id = acc_obj["id"]
+                                st.session_state["account_id"] = acc_id
+                            inst_id = CONTRACTS[cur_ticket["symbol"]]["instrument_id"]
+                            ev_ta = EvidenceIn(
+                                raw=_ta_json.dumps(cur_ticket, ensure_ascii=False, default=str),
+                                provider="trading_assistant_v2",
+                                data_quality="unverified",
+                                label="TRADING_ASSISTANT_V2",
+                                relation="supports",
+                            )
+                            th_ta = svc.create_thesis(ThesisCreate(
+                                instrument_id=inst_id,
+                                author="local-trader",
+                                direction=cur_ticket["side"],
+                                horizon_days=2,
+                                invalidation=f"Stop loss at {pr['stop_loss']}",
+                                subjective_confidence=0.5,
+                                statement=f"TRADING_ASSISTANT_V2 pre-trade ticket for {cur_ticket['symbol']} ({cur_ticket['side']}).",
+                                label="TRADING_ASSISTANT_V2",
+                                is_example=True,
+                                evidence=[ev_ta],
+                            ))
+                            plan_ta = ext_ta.create_sandbox_plan(
+                                thesis_id=th_ta["id"],
+                                account_id=acc_id,
+                                symbol=cur_ticket["symbol"],
+                                side=cur_ticket["side"],
+                                entry_price=float(pr["planned_entry"]),
+                                stop_loss=float(pr["stop_loss"]),
+                                leverage=float(ta_lev),
+                                research_run_id=None,
+                            )
+                            st.session_state["thesis_id"] = th_ta["id"]
+                            st.session_state["paper_plan_id"] = plan_ta["id"]
+                            st.success(f"已创建待批模拟计划 `{plan_ta['id']}`（未自动批准），可切换至 `Paper account` 标签页人工审批与模拟成交。")
+                        except Exception as exc:
+                            st.error(f"同步模拟盘计划失败：{exc}")
+
+        st.divider()
+        st.subheader("🛡️ 持仓风控与移动止损顾问 (Position Monitor)")
+        pm1, pm2, pm3, pm4, pm5, pm6 = st.columns(6)
+        pm_sym = pm1.selectbox("持仓标的 (v2)", list(CONTRACTS), key="ta_pos_sym")
+        pm_side = pm2.selectbox("持仓方向 (v2)", ["long", "short"], key="ta_pos_side")
+        pm_entry = pm3.number_input("开仓均价 (v2)", min_value=0.0, value=float(SAMPLE_MARKS[pm_sym]["mark"]), format="%.4f", key="ta_pos_entry")
+        pm_qty = pm4.number_input("持仓张数 (v2)", min_value=0.0, value=0.01, format="%.4f", key="ta_pos_qty")
+        pm_stop = pm5.number_input("当前止损价 (v2)", min_value=0.0, value=round(float(SAMPLE_MARKS[pm_sym]["mark"]) * 0.98, 4), format="%.4f", key="ta_pos_stop")
+        pm_mark = pm6.number_input("当前标记价 (0=实时拉取)", min_value=0.0, value=float(SAMPLE_MARKS[pm_sym]["mark"]), format="%.4f", key="ta_pos_mark")
+
+        if st.button("🔍 诊断当前持仓与移动止损", key="ta_btn_pos_advice"):
+            try:
+                advice_out = advise_open_position(
+                    symbol=pm_sym,
+                    side=pm_side,
+                    entry_price=float(pm_entry),
+                    qty=float(pm_qty),
+                    stop_loss=float(pm_stop),
+                    leverage=float(ta_lev),
+                    mark_price=float(pm_mark) if pm_mark > 0 else None,
+                    fetch_live=(pm_mark <= 0),
+                )
+                st.session_state["ta_pos_advice"] = advice_out
+            except Exception as exc:
+                st.session_state.pop("ta_pos_advice", None)
+                st.error(f"持仓诊断失败：{exc}")
+
+        pos_adv = st.session_state.get("ta_pos_advice")
+        if pos_adv:
+            pnl_d = pos_adv["pnl"]
+            rl_d = pos_adv["risk_levels"]
+            a1, a2, a3, a4 = st.columns(4)
+            a1.metric("扣费后净浮盈", f"{pnl_d['net_unrealized_after_fees_usdt']:+.2f} U", f"保证金ROE {pnl_d['roe_on_margin_pct']:+.2f}%")
+            r_str = f"{pnl_d['current_r_multiple']:+.2f}R" if pnl_d.get("current_r_multiple") is not None else "N/A"
+            a2.metric("当前风险倍数 (R)", r_str, f"状态: {pos_adv['status']}")
+            a3.metric("建议移动止损价", f"{rl_d['recommended_stop_loss']:.4f}", f"含费保本 {rl_d['fee_adjusted_breakeven']:.4f}")
+            liq_d_str = f"{rl_d['distance_to_liquidation_pct']:.2f}%" if rl_d.get("distance_to_liquidation_pct") is not None else "N/A"
+            a4.metric("距止损 / 距强平", f"{rl_d['distance_to_stop_pct']:.2f}%", f"距强平 {liq_d_str}")
+            for act in pos_adv.get("actions") or []:
+                st.info(act)
 
     with tab_chat:
         import json
