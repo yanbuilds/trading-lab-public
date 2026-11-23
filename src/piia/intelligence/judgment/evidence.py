@@ -163,60 +163,117 @@ def validate_atom_temporal_bounds(
     return out
 
 
+def sanitize_closed_candles(
+    raw_candles: list[Any] | None,
+    *,
+    bar_cutoff_utc: datetime,
+    bar_duration: timedelta = timedelta(hours=1),
+    window: int | None = None,
+) -> dict[str, Any]:
+    """Filter invalid/unclosed/future candles first, sort chronologically, deduplicate, then slice `window`."""
+    bar_cutoff_utc = bar_cutoff_utc.astimezone(timezone.utc)
+    raw_list = list(raw_candles or [])
+    audit: dict[str, Any] = {
+        "raw_count": len(raw_list),
+        "dropped_invalid": 0,
+        "dropped_unclosed": 0,
+        "dropped_future": 0,
+        "dropped_duplicate": 0,
+        "was_out_of_order": False,
+        "valid_count": 0,
+        "window_count": 0,
+        "source_bar_cutoff_utc": bar_cutoff_utc.isoformat(),
+    }
+    valid: list[tuple[datetime, datetime, dict[str, Any]]] = []
+    for c in raw_list:
+        if not isinstance(c, dict):
+            audit["dropped_invalid"] += 1
+            continue
+        open_dt = _ts_utc(c.get("open_at_utc"))
+        close_dt = _ts_utc(c.get("close_at_utc"))
+        if open_dt is None or close_dt is None:
+            audit["dropped_invalid"] += 1
+            continue
+        try:
+            op = float(c["open"])
+            hi = float(c["high"])
+            lo = float(c["low"])
+            cl = float(c["close"])
+            vol = float(c.get("volume") or 0.0)
+        except (KeyError, TypeError, ValueError):
+            audit["dropped_invalid"] += 1
+            continue
+        if not all(math.isfinite(v) for v in (op, hi, lo, cl, vol)) or op <= 0 or hi < lo or hi < max(op, cl) or lo > min(op, cl) or vol < 0:
+            audit["dropped_invalid"] += 1
+            continue
+        if close_dt - open_dt != bar_duration or c.get("is_closed") is False or c.get("closed") is False or str(c.get("confirm", "1")) == "0":
+            audit["dropped_unclosed"] += 1
+            continue
+        if close_dt > bar_cutoff_utc:
+            audit["dropped_future"] += 1
+            continue
+        valid.append(
+            (
+                open_dt,
+                close_dt,
+                {
+                    "open_at_utc": open_dt.isoformat(),
+                    "close_at_utc": close_dt.isoformat(),
+                    "open": op,
+                    "high": hi,
+                    "low": lo,
+                    "close": cl,
+                    "volume": vol,
+                },
+            )
+        )
+
+    if any(valid[i][0] > valid[i + 1][0] for i in range(len(valid) - 1)):
+        audit["was_out_of_order"] = True
+    valid.sort(key=lambda item: item[0])
+
+    deduped: list[dict[str, Any]] = []
+    seen_opens: set[datetime] = set()
+    for open_dt, _close_dt, row in valid:
+        if open_dt in seen_opens:
+            audit["dropped_duplicate"] += 1
+            continue
+        seen_opens.add(open_dt)
+        deduped.append(row)
+
+    audit["valid_count"] = len(deduped)
+    sliced = deduped[-int(window) :] if (window is not None and window > 0) else deduped
+    audit["window_count"] = len(sliced)
+    return {"candles": sliced, "all_sanitized": deduped, "audit": audit}
+
+
 def validate_market_snapshot_coherence(
     market_snapshot: dict[str, Any],
     *,
     cutoff_utc: datetime,
 ) -> dict[str, Any]:
-    """Verify all three contracts share closed 1h cutoff == `cutoff_utc` with no future/gapped bars."""
+    """Sanitize and verify all three contracts share closed 1h cutoff == `cutoff_utc` without gaps."""
     cutoff_utc = cutoff_utc.astimezone(timezone.utc)
     one_h = timedelta(hours=1)
     reasons: list[str] = []
     last_close_by_sym: dict[str, str | None] = {}
     frames_1h: dict[str, pd.DataFrame] = {}
     frames_1d: dict[str, pd.DataFrame] = {}
+    sanitization_audit: dict[str, Any] = {}
 
     for sym in SYMBOLS:
         inst = (market_snapshot.get("instruments") or {}).get(sym) or {}
-        candles = inst.get("candles_closed_1h") or []
-        if not candles:
+        clean_1h = sanitize_closed_candles(inst.get("candles_closed_1h"), bar_cutoff_utc=cutoff_utc, bar_duration=one_h)
+        sanitized = clean_1h["all_sanitized"]
+        sanitization_audit[sym] = clean_1h["audit"]
+        if not sanitized:
             reasons.append(f"missing_1h_candles:{sym}")
             last_close_by_sym[sym] = None
             continue
-        rows, idx = [], []
-        bad = False
-        for c in candles:
-            try:
-                open_dt = _ts_utc(c["open_at_utc"])
-                close_dt = _ts_utc(c["close_at_utc"])
-                if open_dt is None or close_dt is None or close_dt - open_dt != one_h:
-                    bad = True
-                    break
-                if close_dt > cutoff_utc:
-                    reasons.append(f"future_1h_candle:{sym}:{close_dt.isoformat()}>{cutoff_utc.isoformat()}")
-                    bad = True
-                    break
-                idx.append(pd.Timestamp(open_dt))
-                rows.append(
-                    {
-                        "open": float(c["open"]),
-                        "high": float(c["high"]),
-                        "low": float(c["low"]),
-                        "close": float(c["close"]),
-                        "volume": float(c.get("volume") or 0.0),
-                    }
-                )
-            except (KeyError, TypeError, ValueError):
-                bad = True
-                break
-        if bad or not rows:
-            if f"future_1h_candle" not in ",".join(reasons):
-                reasons.append(f"invalid_1h_candles:{sym}")
-            last_close_by_sym[sym] = None
-            continue
+
+        idx = [pd.Timestamp(_ts_utc(c["open_at_utc"])) for c in sanitized]
+        rows = [{"open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]} for c in sanitized]
         df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx, name="date")).sort_index()
-        if df.index.has_duplicates:
-            reasons.append(f"duplicate_1h_candles:{sym}")
         diffs = df.index.to_series().diff().dropna()
         if not diffs.empty and bool((diffs != one_h).any()):
             reasons.append(f"gapped_1h_candles:{sym}")
@@ -226,27 +283,10 @@ def validate_market_snapshot_coherence(
             reasons.append(f"lagging_1h_candle:{sym}:{last_close.isoformat()}<{cutoff_utc.isoformat()}")
         frames_1h[sym] = df
 
-        # Parse closed UTC daily candles <= cutoff_utc when provided
-        d_rows, d_idx = [], []
-        for dc in inst.get("candles_closed_1d") or []:
-            try:
-                do = _ts_utc(dc["open_at_utc"])
-                dc_close = _ts_utc(dc["close_at_utc"])
-                if do is None or dc_close is None or dc_close > cutoff_utc:
-                    continue
-                d_idx.append(pd.Timestamp(do))
-                d_rows.append(
-                    {
-                        "open": float(dc["open"]),
-                        "high": float(dc["high"]),
-                        "low": float(dc["low"]),
-                        "close": float(dc["close"]),
-                        "volume": float(dc.get("volume") or 0.0),
-                    }
-                )
-            except (KeyError, TypeError, ValueError):
-                continue
-        if d_rows:
+        clean_1d = sanitize_closed_candles(inst.get("candles_closed_1d"), bar_cutoff_utc=cutoff_utc, bar_duration=timedelta(days=1))
+        if clean_1d["all_sanitized"]:
+            d_idx = [pd.Timestamp(_ts_utc(c["open_at_utc"])) for c in clean_1d["all_sanitized"]]
+            d_rows = [{"open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]} for c in clean_1d["all_sanitized"]]
             frames_1d[sym] = pd.DataFrame(d_rows, index=pd.DatetimeIndex(d_idx, name="date")).sort_index()
 
     if len({v for v in last_close_by_sym.values() if v is not None}) > 1:
@@ -259,6 +299,7 @@ def validate_market_snapshot_coherence(
         "last_close_by_symbol": last_close_by_sym,
         "frames_1h": frames_1h,
         "frames_1d": frames_1d,
+        "sanitization_audit": sanitization_audit,
     }
 
 
@@ -377,6 +418,14 @@ def _series_stats(
 ) -> dict[str, Any]:
     if not isinstance(series_entry, dict) or not series_entry.get("observations"):
         return {"status": "missing"}
+    raw_vintage = series_entry.get("vintage_date")
+    if raw_vintage:
+        try:
+            v_date = datetime.strptime(str(raw_vintage)[:10], "%Y-%m-%d").date()
+            if v_date > cutoff_utc.date():
+                return {"status": "future_vintage_excluded", "vintage_date": str(raw_vintage)}
+        except ValueError:
+            pass
     usable: list[tuple[datetime, float, datetime]] = []
     for row in series_entry["observations"]:
         try:
@@ -596,10 +645,10 @@ def build_macro_evidence(
                 freshness_status="missing",
                 applies_to_symbols=list(SYMBOLS),
                 applies_to_horizons=["intraday", "swing_1_3d"],
-                value_summary={"status": "unavailable", "reason": (dxy_live or {}).get("reason") or "no_verified_realtime_ice_dxy", "is_ice_dxy": False},
+                value_summary={"status": "unavailable", "reason": (dxy_live or {}).get("reason") or "ice_proprietary_index_no_free_verified_realtime_api", "is_ice_dxy": False},
                 direction_by_symbol={s: "unknown" for s in SYMBOLS},
                 causal_driver_group="usd_real_rate_tightening",
-                limitation_note="未获取到带可核验盘中时间戳的 ICE DXY，绝不以广义美元指数冒充实时 DXY",
+                limitation_note="未获取到带可核验盘中时间戳的 ICE DXY（属商业专有指数且免费源无带可信UTC时钟实时值），绝不以广义美元指数冒充实时 DXY",
             )
         )
 
@@ -637,6 +686,7 @@ def build_macro_evidence(
             )
         )
     else:
+        dtwex_fresh = "future_excluded" if dtwex["status"] == "future_vintage_excluded" else ("missing" if dtwex["status"] == "missing" else "stale_excluded")
         atoms.append(
             make_atom(
                 evidence_id="macro:broad_dollar_proxy:DTWEXBGS",
@@ -651,17 +701,40 @@ def build_macro_evidence(
                 available_at_utc=None,
                 available_at_known=False,
                 retrieved_at_utc=cutoff_iso,
-                freshness_status="missing" if dtwex["status"] == "missing" else "stale_excluded",
+                freshness_status=dtwex_fresh,
                 applies_to_symbols=list(SYMBOLS),
                 applies_to_horizons=["swing_1_3d"],
                 value_summary={"status": dtwex["status"]},
                 direction_by_symbol={s: "unknown" for s in SYMBOLS},
                 causal_driver_group="usd_real_rate_tightening",
-                limitation_note="广义美元代理序列缺失或过期",
+                limitation_note="广义美元代理序列缺失、过期或含未来修订版本号",
             )
         )
 
-    # 1c. Daily Real Yield (DFII10) & Nominal Rates (DGS10, DGS2, DFF)
+    # 1c. Daily Real Yield (DFII10), Intraday Real Yield Gap, & Nominal Rates (DGS10, DGS2, DFF)
+    atoms.append(
+        make_atom(
+            evidence_id="macro:real_yield_intraday",
+            domain="macro",
+            factor_name="盘中实时美国实际利率",
+            source_name="unverified_or_unavailable",
+            source_url=None,
+            raw_sha256=None,
+            data_tier="unavailable",
+            observed_at_utc=None,
+            published_at_utc=None,
+            available_at_utc=None,
+            available_at_known=False,
+            retrieved_at_utc=cutoff_iso,
+            freshness_status="missing",
+            applies_to_symbols=list(SYMBOLS),
+            applies_to_horizons=["intraday"],
+            value_summary={"status": "unavailable", "reason": "tips_intraday_real_yield_requires_licensed_dealer_feed", "intraday_realtime": False},
+            direction_by_symbol={s: "unknown" for s in SYMBOLS},
+            causal_driver_group="usd_real_rate_tightening",
+            limitation_note="公开免费数据源无盘中实时 TIPS 实际利率报价，日频 DFII10 绝不冒充盘中实时值",
+        )
+    )
     dfii = _series_stats(alfred_series.get("DFII10"), cutoff_utc=cutoff_utc, max_age_days=max_days)
     dgs10 = _series_stats(alfred_series.get("DGS10"), cutoff_utc=cutoff_utc, max_age_days=max_days)
     dgs2 = _series_stats(alfred_series.get("DGS2"), cutoff_utc=cutoff_utc, max_age_days=max_days)
@@ -699,6 +772,7 @@ def build_macro_evidence(
             )
         )
     else:
+        dfii_fresh = "future_excluded" if dfii["status"] == "future_vintage_excluded" else ("missing" if dfii["status"] == "missing" else "stale_excluded")
         atoms.append(
             make_atom(
                 evidence_id="macro:real_yield_daily:DFII10",
@@ -713,13 +787,13 @@ def build_macro_evidence(
                 available_at_utc=None,
                 available_at_known=False,
                 retrieved_at_utc=cutoff_iso,
-                freshness_status="missing" if dfii["status"] == "missing" else "stale_excluded",
+                freshness_status=dfii_fresh,
                 applies_to_symbols=list(SYMBOLS),
                 applies_to_horizons=["swing_1_3d"],
                 value_summary={"status": dfii["status"], "intraday_realtime": False},
                 direction_by_symbol={s: "unknown" for s in SYMBOLS},
                 causal_driver_group="usd_real_rate_tightening",
-                limitation_note="实际利率日频序列缺失或过期",
+                limitation_note="实际利率日频序列缺失、过期或含未来修订版本号",
             )
         )
 
@@ -924,6 +998,7 @@ def build_sentiment_flow_evidence(
     polymarket_ctx: dict[str, Any] | None,
     cutoff_utc: datetime,
     cfg: dict[str, Any],
+    replay_mode: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Build Domain 3 (Sentiment & Capital Flows) atoms across BTC, NDX100, Gold, and Polymarket."""
     cutoff_iso = cutoff_utc.isoformat()
@@ -932,8 +1007,10 @@ def build_sentiment_flow_evidence(
     atoms: list[dict[str, Any]] = []
 
     # 3A. BTC Fear & Greed
-    fg_obs = (fear_greed_ctx or {}).get("observations") or []
-    fg_ok = bool((fear_greed_ctx or {}).get("usable_for_research") and fg_obs)
+    fg_raw = fear_greed_ctx or {}
+    fg_pit_ok = (not replay_mode) or bool(fg_raw.get("historical_point_in_time_verified"))
+    fg_obs = (fg_raw.get("observations") or []) if fg_pit_ok else []
+    fg_ok = bool(fg_pit_ok and fg_raw.get("usable_for_research") and fg_obs)
     fg_val = fg_obs[0].get("value") if fg_obs else None
     fg_ts = fg_obs[0].get("observed_at_utc") if fg_obs else None
     fg_dir = {s: "unknown" for s in SYMBOLS}
@@ -951,63 +1028,109 @@ def build_sentiment_flow_evidence(
                 domain="sentiment_flow",
                 factor_name="加密恐惧贪婪指数 (Alternative.me)",
                 source_name="Alternative.me",
-                source_url=(fear_greed_ctx or {}).get("source_url"),
-                raw_sha256=(fear_greed_ctx or {}).get("raw_sha256"),
-                data_tier="lagged_official_report",
+                source_url=fg_raw.get("source_url"),
+                raw_sha256=fg_raw.get("raw_sha256"),
+                data_tier="lagged_official_report" if fg_pit_ok else "unavailable",
                 observed_at_utc=fg_ts,
                 published_at_utc=fg_ts,
                 available_at_utc=fg_ts,
                 available_at_known=fg_ok,
-                retrieved_at_utc=(fear_greed_ctx or {}).get("retrieved_at_utc") or cutoff_iso,
+                retrieved_at_utc=fg_raw.get("retrieved_at_utc") or cutoff_iso,
                 freshness_status="lagged_usable" if fg_ok else "missing",
                 applies_to_symbols=["BTCUSDT"],
                 applies_to_horizons=["intraday", "swing_1_3d"],
-                value_summary={"value": fg_val, "classification": fg_obs[0].get("classification") if fg_obs else None},
+                value_summary={
+                    "value": fg_val,
+                    "classification": fg_obs[0].get("classification") if fg_obs else None,
+                    "api_responded_ok": bool(fg_raw.get("usable_for_research")),
+                    "reason": None if fg_ok else ("not_available_point_in_time_in_replay" if not fg_pit_ok else "unavailable"),
+                },
                 direction_by_symbol=fg_dir,
                 causal_driver_group="btc_sentiment_crowding",
-                limitation_note="日频综合情绪指标，非独立于价格的交易信号",
+                limitation_note="日频综合情绪指标，非独立于价格的交易信号；历史回放不回填",
             ),
             cutoff_utc=cutoff_utc,
             max_age_hours=float(fcfg["fear_greed_max_age_hours"]),
         )
     )
 
-    # 3B. US Spot BTC ETF Flows (dashes '-' NEVER converted to zero!)
+    # 3B. US Spot BTC ETF Flows (dashes '-' NEVER converted to zero; supports both Farside 3d and TFTC 1d!)
     etf_obj = etf_ctx or {}
+    etf_pit_ok = (not replay_mode) or bool(etf_obj.get("historical_point_in_time_verified"))
     latest_row = etf_obj.get("latest_row") or {}
     latest_complete = etf_obj.get("latest_complete_row") or {}
     complete_days = [d for d in (etf_obj.get("complete_daily_flows") or []) if d.get("complete")]
     complete_days.sort(key=lambda d: str(d.get("flow_date") or ""))
     etf_3d_sum = None
+    etf_latest_single = None
     etf_fresh = "missing"
     etf_dir = {s: "unknown" for s in SYMBOLS}
+    etf_mode = "unavailable"
     partial_unreported = bool(etf_obj.get("latest_row_is_partial") or (latest_row and not latest_row.get("complete")))
-    if etf_obj.get("usable_for_btc_research") and latest_complete:
-        asof_d = str(latest_complete.get("flow_date") or etf_obj.get("asof_complete_flow_date") or "")
-        recent_3 = [d for d in complete_days if str(d.get("flow_date") or "") <= cutoff_utc.date().isoformat()][-3:]
-        vals_3 = [d.get("sum_of_reported_funds_millions_usd") for d in recent_3 if d.get("sum_of_reported_funds_millions_usd") is not None]
-        if len(vals_3) == 3:
-            etf_3d_sum = round(sum(float(v) for v in vals_3), 3)
-            etf_fresh = "lagged_usable"
-            if etf_3d_sum <= float(mcfg["etf_3d_outflow_musd"]):
-                etf_dir["BTCUSDT"] = "bearish"
-            elif etf_3d_sum >= float(mcfg["etf_3d_inflow_musd"]):
-                etf_dir["BTCUSDT"] = "bullish"
-            else:
-                etf_dir["BTCUSDT"] = "neutral"
+    etf_max_days = int(fcfg.get("etf_complete_max_age_days", 7))
+    etf_mod_dt = _ts_utc(etf_obj.get("date_modified"))
+
+    if not etf_pit_ok:
+        etf_mode = "not_available_point_in_time_in_replay"
+    elif etf_obj.get("usable_for_btc_research") and latest_complete:
+        if etf_mod_dt is not None and etf_mod_dt > cutoff_utc:
+            etf_fresh = "future_excluded"
+            etf_mode = "date_modified_after_cutoff"
+        else:
+            recent_3 = [d for d in complete_days if str(d.get("flow_date") or "") <= cutoff_utc.date().isoformat()][-3:]
+            vals_3 = [d.get("sum_of_reported_funds_millions_usd") for d in recent_3 if d.get("sum_of_reported_funds_millions_usd") is not None]
+            flow_d_str = str(latest_complete.get("flow_date") or "")
+            flow_d_ok = False
+            if flow_d_str and flow_d_str <= cutoff_utc.date().isoformat():
+                try:
+                    fd = datetime.strptime(flow_d_str[:10], "%Y-%m-%d").date()
+                    flow_d_ok = 0 <= (cutoff_utc.date() - fd).days <= etf_max_days
+                except ValueError:
+                    flow_d_ok = False
+            if len(vals_3) == 3 and flow_d_ok:
+                etf_3d_sum = round(sum(float(v) for v in vals_3), 3)
+                etf_fresh = "lagged_usable"
+                etf_mode = "three_day_complete_farside"
+                if etf_3d_sum <= float(mcfg["etf_3d_outflow_musd"]):
+                    etf_dir["BTCUSDT"] = "bearish"
+                elif etf_3d_sum >= float(mcfg["etf_3d_inflow_musd"]):
+                    etf_dir["BTCUSDT"] = "bullish"
+                else:
+                    etf_dir["BTCUSDT"] = "neutral"
+            elif flow_d_ok and latest_complete.get("complete") is True:
+                single_v = latest_complete.get("table_total_millions_usd")
+                if single_v is None:
+                    single_v = latest_complete.get("sum_of_reported_funds_millions_usd")
+                if single_v is not None and math.isfinite(float(single_v)):
+                    etf_latest_single = round(float(single_v), 3)
+                    etf_fresh = "lagged_usable"
+                    etf_mode = "single_complete_session_tftc" if "tftc" in str(etf_obj.get("kind") or "") else "single_complete_session"
+                    if etf_latest_single <= float(mcfg.get("etf_1d_outflow_musd", -100.0)):
+                        etf_dir["BTCUSDT"] = "bearish"
+                    elif etf_latest_single >= float(mcfg.get("etf_1d_inflow_musd", 100.0)):
+                        etf_dir["BTCUSDT"] = "bullish"
+                    else:
+                        etf_dir["BTCUSDT"] = "neutral"
+
     latest_flow_date = latest_complete.get("flow_date") or latest_row.get("flow_date")
+    latest_complete_val = (
+        latest_complete.get("sum_of_reported_funds_millions_usd")
+        if latest_complete.get("sum_of_reported_funds_millions_usd") is not None
+        else latest_complete.get("table_total_millions_usd")
+    )
+    etf_pub_iso = etf_mod_dt.isoformat() if etf_mod_dt is not None else (f"{latest_flow_date}T21:00:00+00:00" if latest_flow_date else None)
     atoms.append(
         make_atom(
             evidence_id="sentiment:btc:spot_etf_flows",
             domain="sentiment_flow",
             factor_name="美国现货 BTC ETF 日净流量 (Farside/TFTC)",
-            source_name="Farside Investors / TFTC",
+            source_name="TFTC Bitcoin ETF Tracker" if "tftc" in str(etf_obj.get("kind") or "") else "Farside Investors / TFTC",
             source_url=etf_obj.get("source_url"),
             raw_sha256=etf_obj.get("raw_sha256"),
-            data_tier="lagged_official_report",
-            observed_at_utc=f"{latest_flow_date}T21:00:00+00:00" if latest_flow_date else None,
-            published_at_utc=f"{latest_flow_date}T21:00:00+00:00" if latest_flow_date else None,
-            available_at_utc=f"{latest_flow_date}T21:00:00+00:00" if latest_flow_date else None,
+            data_tier="lagged_official_report" if etf_pit_ok else "unavailable",
+            observed_at_utc=f"{latest_flow_date}T21:00:00+00:00" if (latest_flow_date and etf_pit_ok) else None,
+            published_at_utc=etf_pub_iso if etf_pit_ok else None,
+            available_at_utc=etf_pub_iso if etf_pit_ok else None,
             available_at_known=etf_fresh == "lagged_usable",
             retrieved_at_utc=etf_obj.get("retrieved_at_utc") or cutoff_iso,
             freshness_status=etf_fresh,
@@ -1015,10 +1138,12 @@ def build_sentiment_flow_evidence(
             applies_to_horizons=["swing_1_3d"],
             value_summary={
                 "usable": etf_fresh == "lagged_usable",
+                "compiler_mode": etf_mode,
+                "api_responded_ok": bool(etf_obj.get("usable_for_btc_research")),
                 "latest_row_is_partial": partial_unreported,
                 "latest_row_unreported_funds": latest_row.get("unreported_fund_count"),
-                "latest_complete_date": latest_complete.get("flow_date"),
-                "latest_complete_musd": latest_complete.get("sum_of_reported_funds_millions_usd"),
+                "latest_complete_date": latest_complete.get("flow_date") if etf_pit_ok else None,
+                "latest_complete_musd": round(float(latest_complete_val), 3) if (latest_complete_val is not None and etf_pit_ok) else None,
                 "sum_3_complete_days_musd": etf_3d_sum,
                 "dashes_treated_as_zero": False,
             },
@@ -1028,7 +1153,7 @@ def build_sentiment_flow_evidence(
                 "最新交易日存在横线/缺报基金（strictly unknown，绝不填零）；"
                 if partial_unreported
                 else ""
-            ) + "日度披露汇总，非盘中实时申赎流水",
+            ) + ("历史回放不回填现货 ETF 数据；" if not etf_pit_ok else "第三方汇编日度已公布完结交易日净流，非盘中实时申赎流水"),
         )
     )
 
@@ -1085,9 +1210,10 @@ def build_sentiment_flow_evidence(
 
     # 3D. BTC On-Chain Network Activity vs Exchange Netflow (explicitly separate!)
     oc = onchain_ctx or {}
+    oc_pit_ok = (not replay_mode) or bool(oc.get("historical_point_in_time_verified"))
     oc_metrics = oc.get("metrics") or {}
     last_blk = oc_metrics.get("last_block") or {}
-    oc_usable = bool(oc.get("usable_for_btc_research") and last_blk.get("observation_at_utc"))
+    oc_usable = bool(oc_pit_ok and oc.get("usable_for_btc_research") and last_blk.get("observation_at_utc"))
     fastest_fee = (oc_metrics.get("recommended_fees") or {}).get("fastestFee")
     oc_dir = {s: "unknown" for s in SYMBOLS}
     if oc_usable:
@@ -1102,23 +1228,25 @@ def build_sentiment_flow_evidence(
                 source_url=oc.get("source_docs"),
                 raw_sha256=canonical_sha256(oc.get("raw_sha256")) if oc.get("raw_sha256") else None,
                 data_tier="realtime_verified" if oc_usable else "unavailable",
-                observed_at_utc=last_blk.get("observation_at_utc"),
-                published_at_utc=last_blk.get("observation_at_utc"),
-                available_at_utc=last_blk.get("observation_at_utc"),
+                observed_at_utc=last_blk.get("observation_at_utc") if oc_pit_ok else None,
+                published_at_utc=last_blk.get("observation_at_utc") if oc_pit_ok else None,
+                available_at_utc=last_blk.get("observation_at_utc") if oc_pit_ok else None,
                 available_at_known=oc_usable,
                 retrieved_at_utc=oc.get("retrieved_at_utc") or cutoff_iso,
                 freshness_status="fresh" if oc_usable else "missing",
                 applies_to_symbols=["BTCUSDT"],
                 applies_to_horizons=["intraday", "swing_1_3d"],
                 value_summary={
-                    "tip_height": (oc_metrics.get("tip_height") or {}).get("value"),
-                    "mempool_tx_count": (oc_metrics.get("mempool") or {}).get("count"),
-                    "fastest_fee_sat_vb": fastest_fee,
+                    "tip_height": (oc_metrics.get("tip_height") or {}).get("value") if oc_pit_ok else None,
+                    "mempool_tx_count": (oc_metrics.get("mempool") or {}).get("count") if oc_pit_ok else None,
+                    "fastest_fee_sat_vb": fastest_fee if oc_pit_ok else None,
                     "measure": "network_activity_and_fee_congestion_not_exchange_flow",
+                    "api_responded_ok": bool(oc.get("usable_for_btc_research")),
+                    "reason": None if oc_usable else ("not_available_point_in_time_in_replay" if not oc_pit_ok else (oc.get("error") or "unavailable")),
                 },
                 direction_by_symbol=oc_dir,
                 causal_driver_group="btc_onchain_network",
-                limitation_note="仅体现比特币全网区块高度与内存池拥堵费用，不等于交易所净流入/流出",
+                limitation_note="仅体现比特币全网区块高度与内存池拥堵费用，不等于交易所净流入/流出；历史回放不回填",
             ),
             cutoff_utc=cutoff_utc,
             max_age_hours=float(fcfg["onchain_tip_max_age_hours"]),
@@ -1266,9 +1394,10 @@ def build_sentiment_flow_evidence(
 
     # 3F. Gold CFTC COT (explicitly lagged futures) + Gold ETF Flows (missing unless verified)
     cot = gold_cot_ctx or {}
-    cot_ok = bool(cot.get("usable_for_gold_research") and cot.get("commitments_contracts"))
+    cot_pit_ok = (not replay_mode) or bool(cot.get("historical_point_in_time_verified"))
+    cot_ok = bool(cot_pit_ok and cot.get("usable_for_gold_research") and cot.get("commitments_contracts"))
     cot_comm = cot.get("commitments_contracts") or {}
-    net_nc = (int(cot_comm["noncommercial_long"]) - int(cot_comm["noncommercial_short"])) if ("noncommercial_long" in cot_comm and "noncommercial_short" in cot_comm) else None
+    net_nc = (int(cot_comm["noncommercial_long"]) - int(cot_comm["noncommercial_short"])) if (cot_pit_ok and "noncommercial_long" in cot_comm and "noncommercial_short" in cot_comm) else None
     cot_dir = {s: "unknown" for s in SYMBOLS}
     if cot_ok and net_nc is not None:
         cot_dir["XAUUSDT"] = "neutral"  # weekly futures positioning background only
@@ -1280,9 +1409,9 @@ def build_sentiment_flow_evidence(
             source_name="U.S. CFTC Public Report",
             source_url=cot.get("source_url"),
             raw_sha256=cot.get("raw_sha256"),
-            data_tier="lagged_official_report",
-            observed_at_utc=f"{cot['asof_date']}T20:30:00+00:00" if cot.get("asof_date") else None,
-            published_at_utc=f"{cot['asof_date']}T20:30:00+00:00" if cot.get("asof_date") else None,
+            data_tier="lagged_official_report" if cot_pit_ok else "unavailable",
+            observed_at_utc=f"{cot['asof_date']}T20:30:00+00:00" if (cot_pit_ok and cot.get("asof_date")) else None,
+            published_at_utc=f"{cot['asof_date']}T20:30:00+00:00" if (cot_pit_ok and cot.get("asof_date")) else None,
             available_at_utc=None,
             available_at_known=False,
             retrieved_at_utc=cot.get("retrieved_at_utc") or cutoff_iso,
@@ -1290,15 +1419,16 @@ def build_sentiment_flow_evidence(
             applies_to_symbols=["XAUUSDT"],
             applies_to_horizons=["swing_1_3d"],
             value_summary={
-                "asof_date": cot.get("asof_date"),
+                "asof_date": cot.get("asof_date") if cot_pit_ok else None,
                 "noncommercial_net_contracts": net_nc,
-                "open_interest_contracts": cot.get("open_interest_contracts"),
+                "open_interest_contracts": cot.get("open_interest_contracts") if cot_pit_ok else None,
                 "is_lagged_weekly_futures": True,
+                "reason": None if cot_ok else ("not_available_point_in_time_in_replay" if not cot_pit_ok else "unavailable"),
             },
             direction_by_symbol=cot_dir,
             causal_driver_group="gold_cot_positioning",
             can_decide_direction_alone=False,
-            limitation_note="COT 为滞后周度 COMEX 期货持仓披露（截至周二、周五发布），不能当作即时买盘或黄金 ETF 资金流",
+            limitation_note="COT 为滞后周度 COMEX 期货持仓披露（截至周二、周五发布），不能当作即时买盘或黄金 ETF 资金流；历史回放不回填",
         )
     )
 
@@ -1332,76 +1462,124 @@ def build_sentiment_flow_evidence(
         )
     )
 
-    # 3G. Polymarket (strict topical, spread<=0.05, book age<=5m filter)
+    # 3G. Polymarket (strict topical, spread<=0.05, book age<=5m, zero future-timestamp filter)
     pm = polymarket_ctx or {}
+    pm_pit_ok = (not replay_mode) or bool(pm.get("historical_point_in_time_verified"))
     pm_max_spread = float(fcfg["polymarket_max_spread"])
     pm_max_age_s = float(fcfg["polymarket_book_max_age_minutes"]) * 60.0
     pm_selected: list[dict[str, Any]] = []
-    for ev in pm.get("events") or []:
+    pm_audit_counts = {"dropped_future_ts": 0, "dropped_stale_ts": 0, "dropped_missing_ts": 0, "dropped_spread_or_illiquid": 0}
+    raw_pm_events = (pm.get("events") or []) if pm_pit_ok else []
+    pm_api_responded_ok = bool(pm_pit_ok and pm.get("usable_for_research") and len(raw_pm_events) > 0)
+
+    for ev in raw_pm_events:
         if not isinstance(ev, dict):
             continue
-        rel = [s for s in (ev.get("relevant_instruments") or []) if s in SYMBOLS]
+        raw_rel = (ev.get("asset_mapping") or {}).get("relevant_instruments") or ev.get("relevant_instruments") or []
+        rel = [s for s in raw_rel if s in SYMBOLS]
         if not rel:
             continue
         deadline = _ts_utc(ev.get("deadline_utc") or ev.get("end_date"))
         if deadline is not None and deadline < cutoff_utc:
             continue
         for m in ev.get("markets") or []:
-            if not isinstance(m, dict):
+            if not isinstance(m, dict) or m.get("closed"):
                 continue
             for o in m.get("outcomes") or []:
                 if not isinstance(o, dict):
                     continue
                 book = o.get("book") or {}
+                book_asof = _ts_utc(book.get("asof_utc") or pm.get("asof_utc"))
+                if book_asof is None:
+                    pm_audit_counts["dropped_missing_ts"] += 1
+                    continue
+                if book_asof > cutoff_utc:
+                    pm_audit_counts["dropped_future_ts"] += 1
+                    continue
                 age_s = book.get("book_age_seconds")
-                spread = book.get("spread")
+                computed_age = (cutoff_utc - book_asof).total_seconds()
+                eff_age = max(float(age_s), computed_age) if age_s is not None else computed_age
+                if eff_age > pm_max_age_s:
+                    pm_audit_counts["dropped_stale_ts"] += 1
+                    continue
+                spread = book.get("official_spread")
+                if spread is None:
+                    spread = book.get("spread_from_book") if book.get("spread_from_book") is not None else book.get("spread")
                 usable = book.get("usable_for_implied_probability") is True
-                if not usable:
+                if not usable or (spread is not None and float(spread) > pm_max_spread):
+                    pm_audit_counts["dropped_spread_or_illiquid"] += 1
                     continue
-                if age_s is not None and float(age_s) > pm_max_age_s:
-                    continue
-                if spread is not None and float(spread) > pm_max_spread:
-                    continue
+                mid = book.get("official_midpoint")
+                if mid is None:
+                    mid = book.get("midpoint_from_book") if book.get("midpoint_from_book") is not None else book.get("midpoint")
+                chg24_obj = book.get("change_24h") or o.get("change_24h") or {}
+                chg_to_dt = _ts_utc(chg24_obj.get("to_timestamp_utc"))
+                chg24_pp = chg24_obj.get("change_24h_pp") if (chg_to_dt is None or chg_to_dt <= cutoff_utc) else None
                 pm_selected.append(
                     {
                         "event_title": ev.get("title") or ev.get("question"),
                         "question": m.get("question") or ev.get("question"),
+                        "category": ev.get("category"),
+                        "mapping_kind": (ev.get("asset_mapping") or {}).get("mapping_kind"),
                         "outcome_name": o.get("name"),
-                        "implied_odds_mid": book.get("midpoint") or o.get("platform_quoted_price"),
-                        "change_24h_pp": (o.get("change_24h") or {}).get("change_24h_pp"),
-                        "observed_at_utc": book.get("asof_utc") or pm.get("asof_utc"),
-                        "spread": spread,
+                        "implied_odds_mid": round(float(mid), 4) if mid is not None else o.get("platform_quoted_price"),
+                        "change_24h_pp": round(float(chg24_pp), 3) if chg24_pp is not None else None,
+                        "observed_at_utc": book_asof.isoformat(),
+                        "spread": round(float(spread), 5) if spread is not None else None,
                         "relevant_symbols": rel,
-                        "url": ev.get("url") or m.get("source_url"),
+                        "url": ev.get("url") or m.get("url") or m.get("source_url"),
                     }
                 )
+
     pm_has = bool(pm_selected)
+    if pm_has:
+        pm_fresh = "fresh"
+        pm_reason = None
+    elif not pm_pit_ok:
+        pm_fresh = "missing"
+        pm_reason = "not_available_point_in_time_in_replay"
+    elif pm_audit_counts["dropped_future_ts"] > 0 and pm_audit_counts["dropped_stale_ts"] == 0 and pm_audit_counts["dropped_spread_or_illiquid"] == 0:
+        pm_fresh = "future_excluded"
+        pm_reason = "all_candidate_books_after_cutoff_future_excluded"
+    elif pm_audit_counts["dropped_stale_ts"] > 0 and pm_audit_counts["dropped_spread_or_illiquid"] == 0:
+        pm_fresh = "stale_excluded"
+        pm_reason = "all_candidate_books_exceeded_5m_age"
+    elif pm_api_responded_ok:
+        pm_fresh = "missing"
+        pm_reason = "api_ok_no_liquid_tight_spread_market_passed_filters"
+    else:
+        pm_fresh = "missing"
+        pm_reason = pm.get("error") or "unavailable"
+
     atoms.append(
         make_atom(
             evidence_id="sentiment:polymarket:filtered_events",
             domain="sentiment_flow",
-            factor_name="Polymarket 直接相关事件赔率 (严格点差<=0.05且5分钟内有效)",
+            factor_name="Polymarket 相关预测市场赔率 (点差<=0.05且5分钟内有效)",
             source_name="Polymarket Gamma + CLOB",
             source_url="https://gamma-api.polymarket.com",
             raw_sha256=canonical_sha256(pm_selected) if pm_has else None,
             data_tier="realtime_verified" if pm_has else "unavailable",
-            observed_at_utc=pm_selected[0]["observed_at_utc"] if pm_has else pm.get("asof_utc"),
-            published_at_utc=pm_selected[0]["observed_at_utc"] if pm_has else pm.get("asof_utc"),
-            available_at_utc=pm_selected[0]["observed_at_utc"] if pm_has else pm.get("asof_utc"),
+            observed_at_utc=pm_selected[0]["observed_at_utc"] if pm_has else (pm.get("asof_utc") if pm_pit_ok else None),
+            published_at_utc=pm_selected[0]["observed_at_utc"] if pm_has else (pm.get("asof_utc") if pm_pit_ok else None),
+            available_at_utc=pm_selected[0]["observed_at_utc"] if pm_has else (pm.get("asof_utc") if pm_pit_ok else None),
             available_at_known=pm_has,
             retrieved_at_utc=pm.get("retrieved_at_utc") or cutoff_iso,
-            freshness_status="fresh" if pm_has else "missing",
+            freshness_status=pm_fresh,
             applies_to_symbols=list(SYMBOLS),
             applies_to_horizons=["intraday", "swing_1_3d"],
             value_summary={
                 "selected_count": len(pm_selected),
                 "events": pm_selected[:5],
+                "api_responded_ok": pm_api_responded_ok,
+                "audit_counts": pm_audit_counts,
+                "missing_or_excluded_reason": pm_reason,
                 "is_market_pricing_not_fact": True,
             },
             direction_by_symbol={s: ("neutral" if pm_has else "unknown") for s in SYMBOLS},
             causal_driver_group="polymarket_odds_context",
             can_decide_direction_alone=False,
-            limitation_note="赔率属于实时流动性盘口市场定价，不是既定事实或校准概率，仅作背景参考",
+            limitation_note="赔率属于实时流动性盘口市场定价，不是既定事实或校准概率，仅作背景参考；API 成功不等于因子参与判断",
         )
     )
 
@@ -1415,6 +1593,8 @@ def build_sentiment_flow_evidence(
     sent_summary = {
         "btc_fear_greed": fg_val if fg_ok else None,
         "btc_etf_3d_musd": etf_3d_sum,
+        "btc_etf_latest_musd": etf_latest_single,
+        "btc_etf_compiler_mode": etf_mode,
         "btc_etf_partial_unreported": partial_unreported,
         "vix": vix_summary,
         "ndx_minus_spx_5obs_pct": rel_spread,
@@ -1644,8 +1824,9 @@ def collect_judgment_inputs(
     from piia.intelligence.public_orderbook import fetch_execution_books
     from piia.intelligence.public_position_tiers import fetch_position_tiers
 
-    now = (now_override or datetime.now(timezone.utc)).astimezone(timezone.utc)
-    cutoff_utc = now.replace(minute=0, second=0, microsecond=0)
+    started_now = (now_override or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    bar_cutoff_utc = started_now.replace(minute=0, second=0, microsecond=0)
+    decision_cutoff_utc = started_now
     collection_errors: dict[str, str] = {}
 
     market_snap = fetch_public_snapshot(list(symbols), candle_limit=300)
@@ -1664,58 +1845,58 @@ def collect_judgment_inputs(
     series_wanted = ["DGS10", "DGS2", "DFII10", "DFF", "DTWEXBGS", "RRPONTSYD", "WDTGAL", "WALCL"]
     if include_live_alfred_extras:
         series_wanted.extend(["VIXCLS", "NASDAQ100", "SP500"])
-    alfred_series, alfred_errors = fetch_alfred_public_series(series_wanted, now=now)
+    alfred_series, alfred_errors = fetch_alfred_public_series(series_wanted, now=decision_cutoff_utc)
     collection_errors.update({f"alfred:{k}": v for k, v in alfred_errors.items()})
 
-    dxy_live = fetch_public_dxy_proxy(cutoff_utc=cutoff_utc)
+    dxy_live = fetch_public_dxy_proxy(cutoff_utc=bar_cutoff_utc)
 
     try:
-        event_calendar = fetch_official_event_calendar(now=now)
+        event_calendar = fetch_official_event_calendar(now=decision_cutoff_utc)
     except Exception as exc:
         event_calendar = {"present_sources": [], "sources": {}, "errors": {"calendar": type(exc).__name__}}
         collection_errors["event_calendar"] = type(exc).__name__
 
     try:
-        etf_ctx = fetch_us_spot_btc_etf_flows(now=now)
+        etf_ctx = fetch_us_spot_btc_etf_flows(now=decision_cutoff_utc)
         if not etf_ctx.get("usable_for_btc_research"):
-            etf_ctx = fetch_tftc_etf(now=now)
+            etf_ctx = fetch_tftc_etf(now=decision_cutoff_utc)
     except Exception as exc:
         etf_ctx = {"usable_for_btc_research": False, "error": type(exc).__name__}
         collection_errors["btc_etf"] = type(exc).__name__
 
     try:
-        fear_greed_ctx = fetch_fear_greed(now=now)
+        fear_greed_ctx = fetch_fear_greed(now=decision_cutoff_utc)
     except Exception as exc:
         fear_greed_ctx = {"usable_for_research": False, "error": type(exc).__name__}
         collection_errors["fear_greed"] = type(exc).__name__
 
     try:
-        gold_cot_ctx = fetch_comex_gold_positioning(now=now)
+        gold_cot_ctx = fetch_comex_gold_positioning(now=decision_cutoff_utc)
     except Exception as exc:
         gold_cot_ctx = {"usable_for_gold_research": False, "error": type(exc).__name__}
         collection_errors["gold_cot"] = type(exc).__name__
 
     try:
-        onchain_ctx = fetch_btc_onchain(now=now)
+        onchain_ctx = fetch_btc_onchain(now=decision_cutoff_utc)
     except Exception as exc:
         onchain_ctx = {"usable_for_btc_research": False, "error": type(exc).__name__}
         collection_errors["btc_onchain"] = type(exc).__name__
 
     try:
-        polymarket_ctx = fetch_prediction_markets(now=now)
+        polymarket_ctx = fetch_prediction_markets(now=decision_cutoff_utc)
     except Exception as exc:
         polymarket_ctx = {"usable_for_research": False, "events": [], "error": type(exc).__name__}
         collection_errors["polymarket"] = type(exc).__name__
 
-    rss_items, rss_err = fetch_official_news_feeds(now=now)
-    edgar_items, edgar_err = fetch_ndx_sec_edgar_filings(cutoff_utc=cutoff_utc)
+    rss_items, rss_err = fetch_official_news_feeds(now=decision_cutoff_utc, include_corporate_ir=True)
+    edgar_items, edgar_err = fetch_ndx_sec_edgar_filings(cutoff_utc=decision_cutoff_utc, retrieved_at=started_now)
     collection_errors.update({f"news_rss:{k}": v for k, v in rss_err.items()})
     collection_errors.update({f"sec_edgar:{k}": v for k, v in edgar_err.items()})
 
     series_for_fc = {}
     for sym in symbols:
         inst = (market_snap.get("instruments") or {}).get(sym) or {}
-        c1h = [c for c in (inst.get("candles_closed_1h") or []) if (_ts_utc(c.get("close_at_utc")) or cutoff_utc) <= cutoff_utc]
+        c1h = sanitize_closed_candles(inst.get("candles_closed_1h"), bar_cutoff_utc=bar_cutoff_utc)["all_sanitized"]
         if c1h:
             series_for_fc[sym] = {"closes": [float(c["close"]) for c in c1h], "last_close_at_utc": c1h[-1]["close_at_utc"], "timeframe": "1H_closed"}
     try:
@@ -1725,10 +1906,15 @@ def collect_judgment_inputs(
     except Exception as exc:
         chronos_payload = {"weights_ran": False, "reason": type(exc).__name__, "forecasts": {}}
 
+    collected_at_utc = datetime.now(timezone.utc).isoformat()
     return {
         "is_synthetic_demo": False,
-        "collected_at_utc": datetime.now(timezone.utc).isoformat(),
-        "cutoff_utc": cutoff_utc.isoformat(),
+        "replay_mode": False,
+        "first_retrieved_at_utc": started_now.isoformat(),
+        "collected_at_utc": collected_at_utc,
+        "bar_cutoff_utc": bar_cutoff_utc.isoformat(),
+        "decision_cutoff_utc": decision_cutoff_utc.isoformat(),
+        "cutoff_utc": bar_cutoff_utc.isoformat(),
         "market_snapshot": market_snap,
         "books_snapshot": books_snap,
         "tiers_snapshot": tiers_snap,

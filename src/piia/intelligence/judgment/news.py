@@ -30,14 +30,44 @@ ALLOWED_NEWS_HOSTS = {
     "www.sec.gov",
     "sec.gov",
     "home.treasury.gov",
+    "nvidianews.nvidia.com",
+    "blogs.nvidia.com",
+    "www.apple.com",
+    "apple.com",
+    "blogs.microsoft.com",
+    "news.microsoft.com",
+    "blog.google",
+    "about.fb.com",
 }
-PRIMARY_OFFICIAL_HOSTS = ALLOWED_NEWS_HOSTS | {"treasury.gov", "imf.org", "www.imf.org", "bis.org", "www.bis.org"}
+PRIMARY_OFFICIAL_HOSTS = ALLOWED_NEWS_HOSTS | {
+    "treasury.gov",
+    "imf.org",
+    "www.imf.org",
+    "bis.org",
+    "www.bis.org",
+    "nvidia.com",
+    "www.nvidia.com",
+    "microsoft.com",
+    "google.com",
+    "about.google",
+    "meta.com",
+    "about.meta.com",
+    "fb.com",
+}
 
 RSS_FEEDS = (
     ("fed_monetary", "Federal Reserve Monetary Policy", "https://www.federalreserve.gov/feeds/press_monetary.xml"),
     ("fed_speeches", "Federal Reserve Speeches", "https://www.federalreserve.gov/feeds/speeches.xml"),
     ("bls_latest", "US Bureau of Labor Statistics", "https://www.bls.gov/feed/bls_latest.rss"),
     ("bea_news", "US Bureau of Economic Analysis", "https://www.bea.gov/rss/rss.xml"),
+)
+
+CORPORATE_IR_FEEDS = (
+    ("nvda_newsroom", "NVIDIA Official Newsroom", "https://nvidianews.nvidia.com/releases.xml"),
+    ("aapl_newsroom", "Apple Newsroom", "https://www.apple.com/newsroom/rss-feed.rss"),
+    ("msft_newsroom", "Microsoft Official Blog", "https://blogs.microsoft.com/feed/"),
+    ("googl_newsroom", "Google Official Blog", "https://blog.google/rss/"),
+    ("meta_newsroom", "Meta Newsroom", "https://about.fb.com/news/feed/"),
 )
 
 # Top Nasdaq-100 constituents monitored via official SEC EDGAR public JSON submissions.
@@ -49,7 +79,8 @@ NDX_TOP_CIKS: tuple[tuple[str, str], ...] = (
     ("META", "0001326801"),
     ("GOOGL", "0001652044"),
 )
-EDGAR_USER_AGENT = "TradingLabPublicResearch/3.0 (public-research-no-trading@users.noreply.github.com)"
+# Compliant SEC EDGAR declarative User-Agent (AppName email)
+EDGAR_USER_AGENT = "TradingLabResearch research-contact@example.org"
 
 _SECONDARY_RE = re.compile(
     r"\b(?:opinion|commentary|analysis|editorial|recap|roundup|wrap|preview|column|newsletter|opinionated)\b|解读|评论|综述|转引|预测汇总",
@@ -84,11 +115,11 @@ _DOVISH_RE = re.compile(
     re.I,
 )
 _POS_TECH_RE = re.compile(
-    r"\b(?:beats|raised guidance|strong revenue|record quarter|buyback|ai demand surges|approved)\b|超预期|上调指引|回购|获批",
+    r"\b(?:reinstat\w*|reappoint\w*|returns as ceo|unanimously reinstat\w*|beats|raised guidance|strong revenue|record quarter|buyback|ai demand surges|approved)\b|复职|重返.*ceo|超预期|上调指引|回购|获批",
     re.I,
 )
 _NEG_TECH_RE = re.compile(
-    r"\b(?:misses|cut guidance|antitrust suit|export curb|export ban|investigation|recall|downward revision|enforcement|hack|breach|outflow)\b|下调指引|反垄断|出口管制|调查|违规|制裁|外流",
+    r"\b(?:resigns as ceo|steps down abruptly|accounting probe|sec investigation|subpoena|misses|cut guidance|antitrust suit|export curb|export ban|investigation|recall|downward revision|enforcement|hack|breach|outflow)\b|下调指引|反垄断|出口管制|调查|违规|制裁|外流|辞职",
     re.I,
 )
 
@@ -184,6 +215,7 @@ def parse_rss_or_atom(xml_bytes: bytes, *, feed_id: str, feed_name: str, retriev
                 "source_kind": "primary_official",
                 "raw_sha256": raw_sha,
                 "retrieved_at_utc": retrieved_at.astimezone(timezone.utc).isoformat(),
+                "first_retrieved_at_utc": retrieved_at.astimezone(timezone.utc).isoformat(),
             }
         )
     return items
@@ -193,23 +225,25 @@ def fetch_official_news_feeds(
     *,
     timeout: float = 10.0,
     now: datetime | None = None,
+    include_corporate_ir: bool = True,
     client: httpx.Client | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
-    """Fetch Fed / BLS / BEA timestamped public RSS/Atom releases (gracefully captures errors)."""
+    """Fetch Fed / BLS / BEA & top NDX100 corporate IR Newsroom RSS/Atom releases (gracefully captures errors)."""
     retrieved = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     collected: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
     own = client is None
     client = client or httpx.Client(timeout=timeout, follow_redirects=True, headers={"User-Agent": EDGAR_USER_AGENT})
+    feeds = list(RSS_FEEDS) + (list(CORPORATE_IR_FEEDS) if include_corporate_ir else [])
     try:
-        for fid, fname, url in RSS_FEEDS:
+        for fid, fname, url in feeds:
             try:
                 host = urlparse(url).hostname
                 if host not in ALLOWED_NEWS_HOSTS:
                     raise ValueError(f"disallowed host {host}")
                 resp = client.get(url)
-                final_host = urlparse(str(resp.url)).hostname
-                if final_host not in ALLOWED_NEWS_HOSTS:
+                final_host = (urlparse(str(resp.url)).hostname or "").lower()
+                if final_host not in PRIMARY_OFFICIAL_HOSTS:
                     raise ValueError(f"redirected off allowlisted host {final_host}")
                 resp.raise_for_status()
                 collected.extend(parse_rss_or_atom(resp.content, feed_id=fid, feed_name=fname, retrieved_at=retrieved))
@@ -224,12 +258,14 @@ def fetch_official_news_feeds(
 def fetch_ndx_sec_edgar_filings(
     *,
     cutoff_utc: datetime,
+    retrieved_at: datetime | None = None,
     lookback_hours: float = 72.0,
     timeout: float = 10.0,
     client: httpx.Client | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, str]]:
     """Fetch recent Form 8-K / 10-Q / 10-K filings for top NDX100 weights from official data.sec.gov."""
     cutoff_utc = cutoff_utc.astimezone(timezone.utc)
+    ret_iso = (retrieved_at or cutoff_utc).astimezone(timezone.utc).isoformat()
     window_start = cutoff_utc - timedelta(hours=lookback_hours)
     filings_out: list[dict[str, Any]] = []
     errors: dict[str, str] = {}
@@ -272,7 +308,8 @@ def fetch_ndx_sec_edgar_filings(
                         if (acc_nodash and doc)
                         else f"https://www.sec.gov/edgar/browse/?CIK={cik}"
                     )
-                    it_desc = items_col[idx] if idx < len(items_col) else ""
+                    it_raw = items_col[idx] if idx < len(items_col) else ""
+                    it_desc = ",".join(str(x) for x in it_raw) if isinstance(it_raw, list) else str(it_raw or "")
                     filings_out.append(
                         {
                             "news_id": f"edgar_{ticker}_{acc_nodash}"[:24],
@@ -286,7 +323,8 @@ def fetch_ndx_sec_edgar_filings(
                             "source_name": "SEC EDGAR Official Submissions",
                             "source_kind": "primary_official",
                             "raw_sha256": raw_sha,
-                            "retrieved_at_utc": cutoff_utc.isoformat(),
+                            "retrieved_at_utc": ret_iso,
+                            "first_retrieved_at_utc": ret_iso,
                         }
                     )
             except Exception as exc:
@@ -354,7 +392,12 @@ def _map_news_impact(item: dict[str, Any]) -> tuple[list[str], dict[str, str], s
             bias_map["BTCUSDT"] = "two_sided_risk"
     elif is_ndx:
         channel = "纳指核心权重股盈利预期与公司事件披露渠道"
-        if _POS_TECH_RE.search(blob) and not _NEG_TECH_RE.search(blob):
+        title_text = str(item.get("title") or "")
+        if _POS_TECH_RE.search(title_text) and not _NEG_TECH_RE.search(title_text):
+            bias_map["NDX100USDT"] = "bullish"
+        elif _NEG_TECH_RE.search(title_text) and not _POS_TECH_RE.search(title_text):
+            bias_map["NDX100USDT"] = "bearish"
+        elif _POS_TECH_RE.search(blob) and not _NEG_TECH_RE.search(blob):
             bias_map["NDX100USDT"] = "bullish"
         elif _NEG_TECH_RE.search(blob) and not _POS_TECH_RE.search(blob):
             bias_map["NDX100USDT"] = "bearish"
@@ -382,6 +425,7 @@ def classify_and_filter_news_items(
     intraday_max_hours: float = 24.0,
     swing_max_hours: float = 72.0,
     duplicate_jaccard_min: float = 0.70,
+    replay_mode: bool = False,
 ) -> list[dict[str, Any]]:
     """Verify timestamps/URLs, reject future/stale items, classify primary/secondary, and dedup reposts."""
     cutoff_utc = cutoff_utc.astimezone(timezone.utc)
@@ -398,8 +442,9 @@ def classify_and_filter_news_items(
             # Skip irrelevant non-market notices (e.g., generic statistical methodology updates)
             continue
 
+        first_ret = raw.get("first_retrieved_at_utc") or raw.get("retrieved_at_utc") or cutoff_utc.isoformat()
         nid = str(raw.get("news_id") or hashlib.sha256(f"{idx}|{url}|{title}".encode("utf-8")).hexdigest()[:16])
-        if raw.get("verified") is False or not title or url is None or pub_dt is None:
+        if raw.get("verified") is False or (replay_mode and raw.get("live_scrape_without_pit_timestamp")) or not title or url is None or pub_dt is None:
             staged.append(
                 {
                     "news_id": nid,
@@ -409,6 +454,7 @@ def classify_and_filter_news_items(
                     "raw_sha256": raw.get("raw_sha256"),
                     "published_at_utc": pub_dt.isoformat() if pub_dt else None,
                     "retrieved_at_utc": raw.get("retrieved_at_utc") or cutoff_utc.isoformat(),
+                    "first_retrieved_at_utc": first_ret,
                     "verification_status": "unverified_unknown",
                     "freshness_status": "missing",
                     "news_kind": "unverified",
@@ -417,7 +463,7 @@ def classify_and_filter_news_items(
                     "affected_symbols": symbols,
                     "bias_by_symbol": {s: "unknown" for s in symbols},
                     "transmission_channel": channel,
-                    "limitation_note": "缺少可核验链接或明确时区发布时间，按规则保留为未知（不计入方向）",
+                    "limitation_note": "缺少可核验链接、明确时区发布时间或历史回放时点证明，按规则保留为未知（不计入方向）",
                 }
             )
             continue
@@ -459,6 +505,7 @@ def classify_and_filter_news_items(
                 "published_at_utc": pub_dt.isoformat(),
                 "age_hours": round(age_hours, 2),
                 "retrieved_at_utc": raw.get("retrieved_at_utc") or cutoff_utc.isoformat(),
+                "first_retrieved_at_utc": first_ret,
                 "verification_status": "verified",
                 "freshness_status": freshness,
                 "news_kind": nkind,

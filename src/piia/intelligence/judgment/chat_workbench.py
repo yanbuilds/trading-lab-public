@@ -53,6 +53,12 @@ def build_summary_table_rows(packet: dict[str, Any]) -> list[dict[str, Any]]:
             changed_tags.append("日内改判")
         if s_d["changed_vs_technical"]:
             changed_tags.append("1-3日改判")
+        if pe.get("status") == "pending_review" or pe.get("review_required"):
+            pe_str = f"待复核 ({', '.join(pe.get('review_triggers') or pe.get('blocking_reasons') or [])})"
+        elif pe.get("eligible"):
+            pe_str = "是"
+        else:
+            pe_str = f"否 ({', '.join(pe.get('blocking_reasons') or ['stand_aside'])})"
         rows.append(
             {
                 "symbol": sym,
@@ -63,7 +69,8 @@ def build_summary_table_rows(packet: dict[str, Any]) -> list[dict[str, Any]]:
                 "swing_1_3d": s_d["final_label_cn"],
                 "changed_vs_technical": "；".join(changed_tags) if changed_tags else "与纯技术面同向",
                 "official_v2_2_1_signal": j["official_v2_2_1_signal"],
-                "paper_eligible": "是" if pe.get("eligible") else f"否 ({', '.join(pe.get('blocking_reasons') or ['stand_aside'])})",
+                "paper_eligible": pe_str,
+                "paper_status": pe.get("status") or ("eligible" if pe.get("eligible") else "blocked"),
                 "top_data_gap": (i_d["data_gaps"] or s_d["data_gaps"] or ["无"])[0],
             }
         )
@@ -72,10 +79,13 @@ def build_summary_table_rows(packet: dict[str, Any]) -> list[dict[str, Any]]:
 
 def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
     table_rows = build_summary_table_rows(packet)
+    lc = packet.get("lifecycle_timestamps") or {}
+    cash_ref = packet.get("starting_cash_usdt")
     lines = [
         f"### 三合约可追溯综合研究判断（截止 UTC：`{packet['cutoff_utc']}` | 快照哈希：`{packet['judgment_hash'][:12]}`）",
         "",
-        "> 声明：本输出为本地研究综合判断（非未校准胜率，无自动下单权限），与冻结 `v2.2.1` 正式信号严格分栏展示。",
+        f"> 声明：本输出为本地研究综合判断（非未校准胜率，无自动下单权限），参考纸面起始资金 `{cash_ref}` USDT，与冻结 `v2.2.1` 正式信号严格分栏展示。",
+        f"> 时点链路：K线截止 `{lc.get('bar_cutoff_utc', packet['cutoff_utc'])}` | 最新公告 `{lc.get('latest_announcement_published_at_utc')}` | 首次抓取 `{lc.get('first_retrieved_at_utc')}` | 判断生成 `{lc.get('judgment_generated_at_utc')}` | 最早可成交 `{lc.get('earliest_executable_at_utc')}`",
         "",
         "| 品种 | 最新收盘 | 纯技术面 (日内/1-3日) | 综合判断：日内 | 综合判断：1-3日 | 相对技术面变化 | v2.2.1 正式信号 | 满足纸面开仓 | 首要数据缺口 |",
         "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
@@ -102,17 +112,43 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
         j = packet["judgments"][sym]
         pos = tide["instrument_positions"][sym]
         i_d, s_d = j["intraday"], j["swing_1_3d"]
+        chg_evs = j.get("evidence_that_changed_conclusion") or []
+        chg_txt = "; ".join(f"[{c.get('horizon')}] {c.get('detail')}" for c in chg_evs[:3]) or "无外部因子推翻纯技术面"
+        supp = j.get("agent_or_human_supplement") or packet.get("agent_or_human_supplement") or {}
+        supp_txt = f"{supp.get('actor')}: {supp.get('note')} ({supp.get('recorded_at_utc')}, 不可绕过风控)" if supp.get("provided") else "无"
         lines.extend(
             [
                 f"##### {SYMBOL_LABELS[sym]}（位置：`{pos['structure_kind_cn']}`）",
                 f"- **日内**：**{i_d['final_label_cn']}**（技术面：{i_d['technical_only']['label_cn']}）—— {i_d['why_changed_or_unchanged_vs_technical']}",
                 f"- **未来 1-3 个交易日**：**{s_d['final_label_cn']}**（技术面：{s_d['technical_only']['label_cn']}）—— {s_d['why_changed_or_unchanged_vs_technical']}",
+                f"- **改变结论的证据**：{chg_txt}",
                 f"- **关键依据**：{'; '.join(i_d['supporting_evidence'][:2] + s_d['supporting_evidence'][:2])}",
                 f"- **最强反证**：{'; '.join(s_d['strongest_counterevidence'][:2])}",
                 f"- **失效与改判条件**：{'; '.join(s_d['invalidation_conditions'][:2])}",
                 f"- **数据缺口**：{', '.join(sorted(set(i_d['data_gaps'] + s_d['data_gaps']))) or '无关键缺失'}",
+                f"- **人工/Agent 补充判断**：{supp_txt}",
             ]
         )
+
+    ledger = packet.get("factor_usage_ledger") or {}
+    if ledger:
+        lines.extend(["", "#### 七大因子域本次使用审计（API 成功 != 参与判断）"])
+        cat_labels = {
+            "macro": "宏观",
+            "tide": "潮汐",
+            "sentiment_positioning": "情绪与仓位",
+            "etf_and_onchain": "ETF与链上",
+            "polymarket": "Polymarket",
+            "news": "新闻与IR",
+            "forecast_models": "预测模型与AI",
+        }
+        for ckey, clabel in cat_labels.items():
+            entries = ledger.get(ckey) or []
+            brief = "；".join(
+                f"{e['factor_id']}=`{e['participation_status_cn']}`(api_ok={e['api_responded_ok']}, src={e['source_name']}, ts={e['timestamp_utc']})"
+                for e in entries[:4]
+            )
+            lines.append(f"- **{clabel}**：{brief or '无条目'}")
 
     fc_by_sym = (packet.get("forecast_and_models") or {}).get("by_symbol") or {}
     ai_prov = (packet.get("forecast_and_models") or {}).get("ai_provenance") or {}
@@ -135,9 +171,15 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
     return {
         "intent": "overview",
         "cutoff_utc": packet["cutoff_utc"],
+        "starting_cash_usdt": cash_ref,
+        "lifecycle_timestamps": lc,
         "judgment_hash": packet["judgment_hash"],
         "counterfactual_simulation": False,
         "summary_table": table_rows,
+        "judgments": packet["judgments"],
+        "factor_usage_ledger": ledger,
+        "audit_coverage": packet.get("audit_coverage"),
+        "agent_or_human_supplement": packet.get("agent_or_human_supplement"),
         "markdown": "\n".join(lines),
     }
 

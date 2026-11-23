@@ -528,16 +528,21 @@ try:
             if jv3_cur:
                 st.caption(
                     f"验证状态: **{jv3_status['validation_status']}** — {jv3_status['validation_note']} | "
-                    f"快照截止 UTC: `{jv3_cur['cutoff_utc']}` | 已用因子: {len(jv3_cur['audit_coverage']['factors_used'])} | "
+                    f"总快照: {jv3_status.get('packets_recorded', 0)} | 最长连续: {jv3_status.get('max_contiguous_hours', 0)}h | 缺失: {jv3_status.get('missing_hours_in_span', 0)}h | "
+                    f"K线截止 UTC: `{(jv3_cur.get('lifecycle_timestamps') or {}).get('bar_cutoff_utc') or jv3_cur['cutoff_utc']}` | "
+                    f"最早可执行: `{(jv3_cur.get('lifecycle_timestamps') or {}).get('earliest_executable_at_utc')}` | "
+                    f"已用因子: {len(jv3_cur['audit_coverage']['factors_used'])} | "
                     f"缺失因子: {len(jv3_cur['audit_coverage']['factors_missing'])} | 剔除未来/过期: {len(jv3_cur['audit_coverage']['factors_excluded'])}"
                 )
                 tbl = build_summary_table_rows(jv3_cur)
                 st.dataframe(_jv3_pd.DataFrame(tbl), width="stretch")
-                with st.expander("🌊 宏观传导解释、三层潮汐、预测与新闻核验明细", expanded=False):
+                with st.expander("🌊 宏观传导解释、三层潮汐、7类因子参与台账与新闻核验明细", expanded=False):
+                    st.write("**生命周期时点:**", jv3_cur.get("lifecycle_timestamps"))
                     st.write("**黄金 vs 纳指宏观分化机制：**", jv3_cur["macro_summary"]["gold_vs_ndx_divergence_note"])
                     st.write("**潮汐大环境：**", jv3_cur["tide"]["macro_backdrop"]["state_cn"])
                     st.write("**当前市场阶段：**", jv3_cur["tide"]["cycle_stage"]["stage_cn"])
                     st.json({
+                        "factor_usage_ledger": jv3_cur.get("factor_usage_ledger"),
                         "macro_summary": {k: v for k, v in jv3_cur["macro_summary"].items() if k != "events"},
                         "forecast_and_models": jv3_cur["forecast_and_models"],
                         "news_audit_top6": jv3_cur.get("news_audit", [])[:6],

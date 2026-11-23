@@ -1,6 +1,20 @@
-# PIIA Judgment v3 — 可追溯多因子跨周期交易判断、对话工作台与对比验证协议
+# PIIA Judgment v3.1.0 — 可追溯多因子跨周期交易判断、对话工作台与公平对比协议
 
-> **状态：研究与影子纸面验证模块（不改冻结基线，不自动下单）**。本协议以 `main` 上已合并的 PIIA v2.2.1（`74ce2eeb0c9ae759001030272fec91ec3992a415`）为对照组，完整保留 `v2.2.1` 与 [FROZEN_POLICY_V1.md](FROZEN_POLICY_V1.md) 的源码、配置和账本不受任何修改。Judgment v3 使用独立配置文件 [config/piia_judgment_v3.yaml](config/piia_judgment_v3.yaml) 与独立影子账本 `data/piia/piia_judgment_v3_shadow.sqlite`（演示用 `data/piia/piia_judgment_v3_demo.sqlite`）。
+> **状态：研究与影子纸面验证模块（不改冻结基线，不自动下单）**。本协议以 `main` 上已合并的 PIIA v2.2.1（`74ce2eeb0c9ae759001030272fec91ec3992a415`）为对照组，完整保留 `v2.2.1` 与 [FROZEN_POLICY_V1.md](FROZEN_POLICY_V1.md) 的源码、配置和账本不受任何修改。Judgment v3.1.0 使用独立配置文件 [config/piia_judgment_v3.yaml](config/piia_judgment_v3.yaml) 与独立影子账本 `data/piia/piia_judgment_v3_shadow.sqlite`（演示用 `data/piia/piia_judgment_v3_demo.sqlite`），无任何实盘或交易所模拟下单权限。
+
+## 1. 五时间戳生命周期与无前视纪律
+
+每次研究判断强制分栏记录完整时点链路，杜绝时序混用或不可成交回放成交：
+1. `bar_cutoff_utc`：三合约共享的最近已闭合 `1h` K 线截止时刻；
+2. `latest_announcement_published_at_utc`：参与本次判断的最新一条官方公告/监管申报发布时刻（严格 `<= decision_cutoff_utc`）；
+3. `first_retrieved_at_utc`：系统首次实际抓取公开外部源的时间戳；
+4. `judgment_generated_at_utc`：规则/AI 综合判断实际生成完成时刻；
+5. `earliest_executable_at_utc`：最早可模拟成交或触发止损的整点（必须不早于 `max(bar_cutoff_utc, judgment_generated_at_utc)` 之后的下一可执行闭合 K 线开盘时刻）。
+
+- **全链路 K 线与载荷清洗（`sanitize_closed_candles`）**：`A0 / A1 / A2 / A3` 四组共同执行“校验有效时间戳与 OHLC 完整性 → 剔除未闭合 K 线 → 剔除晚于截止时间的未来 K 线 → 按时间升序排列 → 去重”后，再截取最近 48 根（`A1`）或完整研究窗口；严禁从原始数组直接切片。
+- **连续小时与缺失小时分离报告**：影子账本同时分别报告累计快照数、当前 `v3.1.0` 连续小时数及跨度内缺失小时数；缺失小时如实留空，绝不补造。
+- **突发冲击与均值回归冲突复核（`pending_review`）**：不仅接入核心权重股（NVDA/AAPL/MSFT/AMZN/META/GOOGL）官方 IR/Newsroom 与 SEC EDGAR `8-K/10-Q/10-K`，即使新闻源漏抓，只要监测到“异常波动 + 向上/向下突破 `48h Donchian` 或站上/跌破 `4H EMA50` + 逆势均值回归信号同时出现”，v3.1.0 对称将纸面开仓资格标为 `pending_review（待复核）` 并列出触发依据（同时原文保留 `v2.2.1` 冻结信号供对照）；“放量”表述仅在经核验成交量高于前 20 根均值 `1.5x` 时使用，否则只写“上破/下破”。
+- **七大领域逐项审计清单（Grokbot 专用）**：`macro`、`tide`、`sentiment_positioning`、`etf_and_onchain`、`polymarket`、`news`、`forecast_models` 逐一区分 `changed_judgment`（改变判断）、`background_only`（仅作背景）、`expired`（过期）、`missing`（缺失）与 `not_run`（未运行）；API 返回成功但过滤后无可用数据时仍标记 `missing`，不计作因子已参与判断。
 
 ## 1. 回答粒度与状态边界
 

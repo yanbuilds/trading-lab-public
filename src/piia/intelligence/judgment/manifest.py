@@ -9,14 +9,15 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[4]
 
 PINNED_SHA256 = {
-    "PIIA_JUDGMENT_V3_PROTOCOL.md": "4ce921613aa29036f76277ec5a6464c9700f59ab7cc58933fe67baac50002add",
-    "config/piia_judgment_v3.yaml": "09b9ae5dae300e6e1e655a04017de16a75293241f5f263597ae4578dcec33bcc",
-    "src/piia/intelligence/judgment/news.py": "bc71a395d11a4f950f5aabf397440b69a1bfaf88cffae9d68710c5a7f943707f",
-    "src/piia/intelligence/judgment/evidence.py": "33e2cc249cebfbaf80901c5c36e01d9e073d8f6300e5a85cc7bd4913d2bdf90a",
-    "src/piia/intelligence/judgment/tide.py": "d1fdbca87698756c0a00d4445dc94822fa071fad741e1d1bb0ab28ad568e5b37",
-    "src/piia/intelligence/judgment/synthesizer.py": "43b57bdc1d74b7c7afa1845af1263f6388d0b48d72b2bc1b1899ad8bbbab98ab",
-    "src/piia/intelligence/judgment/chat_workbench.py": "65a7c844d7e4489f99b68a5e705e108447494e4063e48ddad4360e8cfc2bc896",
-    "src/piia/intelligence/judgment/evaluation.py": "599c72a5e62a8a72e7c36d0f3013db22bc768e5df8be4160273fcf4a3941d2f2",
+    "PIIA_JUDGMENT_V3_PROTOCOL.md": "679a6bb09b40c21b988d2927106560809d3b4bebf1f1bd5c684d32336b369dad",
+    "config/piia_judgment_v3.yaml": "2249f32273f09de677f5b78e4552fbba18e670644363fb28fc4c316282ca3123",
+    "src/piia/intelligence/judgment/news.py": "4bb8ecd0d46e3016cdd502517ac42a458a0841065ab84e963d092a32f828c0c3",
+    "src/piia/intelligence/judgment/evidence.py": "0fb573743d677517ab2b7e6f39b35c7530a4abd2c7026c355cd4a483859593c6",
+    "src/piia/intelligence/judgment/tide.py": "88fda335b845915eebad16db4f4841c6fcdf8b0aae004f60c149776755a059fb",
+    "src/piia/intelligence/judgment/synthesizer.py": "eec3b3e378d5f381ba8c86e432ea6505967c324d081ec9ebe144284384fb0ba4",
+    "src/piia/intelligence/judgment/chat_workbench.py": "70df54bada077938f8ec9c076e704d2cd1d709a8da06ef8e70663b06111c661c",
+    "src/piia/intelligence/judgment/evaluation.py": "0a511066fb6c29b256bf1eedd9ff6e5d97903840b71352d9bd5b839396117cf2",
+    "experiments/replay_nvidia_20261123_case.py": "1fe93603fbe88742eb96a95f553ef550917a78d3d99972b4cff2d2f0d36a0a85",
 }
 
 

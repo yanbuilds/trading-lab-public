@@ -141,13 +141,46 @@ def _compute_instrument_position(
     atr_ratio = (atr14 / atr_m) if (atr_m is not None and atr_m > 0) else None
     ret_24h = ((close_px / float(df_1h.iloc[-25]["close"]) - 1.0) * 100.0) if len(df_1h) >= 25 else None
 
-    if adx14 < float(tcfg["adx_range_max"]) and h1_dir != h4_dir:
+    last_bar = df_1h.iloc[-1]
+    curr_vol = _safe_float(last_bar.get("volume"))
+    vol_ma20 = None
+    if len(df_1h) >= 21:
+        v_slice = df_1h["volume"].iloc[-21:-1].astype(float)
+        mean_v = float(v_slice.mean())
+        if math.isfinite(mean_v) and mean_v > 0:
+            vol_ma20 = mean_v
+    vol_ratio_20h = (curr_vol / vol_ma20) if (curr_vol is not None and curr_vol > 0 and vol_ma20 is not None and vol_ma20 > 0) else None
+    vol_surge_mult = float(tcfg.get("volume_surge_mult", 1.5))
+    volume_surge_verified = bool(vol_ratio_20h is not None and vol_ratio_20h >= vol_surge_mult)
+
+    bar_hi = _safe_float(last_bar.get("high")) or close_px
+    bar_lo = _safe_float(last_bar.get("low")) or close_px
+    bar_range_atr = ((bar_hi - bar_lo) / atr14) if atr14 > 0 else 0.0
+    shock_vol = bool(
+        bar_range_atr >= float(tcfg.get("shock_bar_range_atr_min", 2.0))
+        or (atr_ratio is not None and atr_ratio >= float(tcfg.get("shock_atr_ratio_min", 1.35)))
+    )
+    broke_donchian_high = bool(don_hi is not None and close_px > don_hi)
+    broke_donchian_low = bool(don_lo is not None and close_px < don_lo)
+    above_h4_ema50 = bool(close_px > h4_50)
+    below_h4_ema50 = bool(close_px < h4_50)
+
+    up_break_word = "放量上破" if volume_surge_verified else "上破"
+    dn_break_word = "放量下破" if volume_surge_verified else "下破"
+
+    if h4_dir == "down" and broke_donchian_high and (adx14 >= float(tcfg["adx_reversal_min"]) or above_h4_ema50 or shock_vol):
+        pos_state = "potential_bullish_reversal"
+        struct_cn = f"4H 偏空但 1H {up_break_word} 48h 高点（向上反转观察）"
+    elif h4_dir == "up" and broke_donchian_low and (adx14 >= float(tcfg["adx_reversal_min"]) or below_h4_ema50 or shock_vol):
+        pos_state = "potential_bearish_reversal"
+        struct_cn = f"4H 偏多但 1H {dn_break_word} 48h 低点（向下反转观察）"
+    elif adx14 < float(tcfg["adx_range_max"]) and h1_dir != h4_dir:
         pos_state = "range_consolidation"
         struct_cn = "低趋势强度区间震荡"
     elif h4_dir == "up" and h1_dir == "up":
-        if daily["direction"] == "down" and adx14 >= float(tcfg["adx_reversal_min"]) and don_hi is not None and close_px > don_hi:
+        if daily["direction"] == "down" and (adx14 >= float(tcfg["adx_reversal_min"]) or shock_vol or above_h4_ema50) and broke_donchian_high:
             pos_state = "potential_bullish_reversal"
-            struct_cn = "潜在底部向上反转候选（1H/4H多头破48h高点，日线尚未转多）"
+            struct_cn = f"潜在底部向上反转候选（1H/4H多头{up_break_word}48h高点，日线尚未转多）"
         elif daily["direction"] == "down":
             pos_state = "bounce_in_downtrend"
             struct_cn = "日线偏空背景下的 1H/4H 逆势反弹"
@@ -155,9 +188,9 @@ def _compute_instrument_position(
             pos_state = "aligned_uptrend"
             struct_cn = "顺势多头结构（1D/4H/1H 一致向上）" if daily["direction"] == "up" else "4H/1H 顺势上行（日线缺口披露）"
     elif h4_dir == "down" and h1_dir == "down":
-        if daily["direction"] == "up" and adx14 >= float(tcfg["adx_reversal_min"]) and don_lo is not None and close_px < don_lo:
+        if daily["direction"] == "up" and (adx14 >= float(tcfg["adx_reversal_min"]) or shock_vol or below_h4_ema50) and broke_donchian_low:
             pos_state = "potential_bearish_reversal"
-            struct_cn = "潜在高位向下反转候选（1H/4H破48h低点，日线尚未转空）"
+            struct_cn = f"潜在高位向下反转候选（1H/4H{dn_break_word}48h低点，日线尚未转空）"
         elif daily["direction"] == "up":
             pos_state = "pullback_in_uptrend"
             struct_cn = "日线偏多背景下的 1H/4H 趋势回踩/回调"
@@ -168,12 +201,8 @@ def _compute_instrument_position(
         pos_state = "pullback_in_uptrend"
         struct_cn = "4H 上行背景下的 1H 回踩整理"
     elif h4_dir == "down" and h1_dir == "up":
-        if adx14 >= float(tcfg["adx_reversal_min"]) and don_hi is not None and close_px > don_hi:
-            pos_state = "potential_bullish_reversal"
-            struct_cn = "4H 偏空但 1H 放量上破 48h 高点（向上反转观察）"
-        else:
-            pos_state = "bounce_in_downtrend"
-            struct_cn = "4H 下行趋势中的 1H 逆势反弹"
+        pos_state = "bounce_in_downtrend"
+        struct_cn = "4H 下行趋势中的 1H 逆势反弹"
     else:
         pos_state = "range_consolidation" if adx14 < float(tcfg["adx_range_max"]) else "transition_uncertain"
         struct_cn = "周期震荡" if pos_state == "range_consolidation" else "多周期切换待确认"
@@ -194,6 +223,14 @@ def _compute_instrument_position(
             "rsi14": round(rsi14, 2) if rsi14 is not None else None,
             "atr14": round(atr14, 4),
             "atr_ratio": round(atr_ratio, 3) if atr_ratio is not None else None,
+            "bar_range_atr": round(bar_range_atr, 3),
+            "shock_volatility": shock_vol,
+            "vol_ratio_20h": round(vol_ratio_20h, 3) if vol_ratio_20h is not None else None,
+            "volume_surge_verified": volume_surge_verified,
+            "broke_donchian_high": broke_donchian_high,
+            "broke_donchian_low": broke_donchian_low,
+            "above_h4_ema50": above_h4_ema50,
+            "below_h4_ema50": below_h4_ema50,
             "h1_ema20": round(e20, 4),
             "h1_ema50": round(e50, 4),
             "h4_ema20": round(h4_20, 4),
@@ -389,7 +426,7 @@ def compute_market_tide(
         and (btc_ret >= -0.5 or ndx_ret >= 0.0)
     ):
         cycle_stage = "repair"
-        stage_cn = "修复阶段（价格守住前低 + 上涨放量回升 + 实际利率或美元压力缓和）"
+        stage_cn = "修复阶段（价格守住前低 + 24h 买盘量比回升 + 实际利率或美元压力缓和）"
         stage_def = "close > 24h_prior_low 且 up/down_vol >= 1.15 且实际利率/宏观缓和"
         stage_flip = ["若实际利率与美元重新急升或再度跌破 24h 前低，将退回退潮/去杠杆"]
     elif (
@@ -411,7 +448,7 @@ def compute_market_tide(
         cycle_stage = "ebbing"
         stage_cn = "退潮阶段（风险偏好走弱 / 资金流降温 / 宏观流动性偏紧）"
         stage_def = "风险资产共振走弱，或宏观逆风叠加机构流入转负/高 VIX"
-        stage_flip = ["若价格企稳放量且宏观/ETF 流入同步改善，将转入修复或扩张"]
+        stage_flip = ["若价格企稳且量比改善、宏观/ETF 流入同步改善，将转入修复或扩张"]
     elif btc_oi is None and etf_3d is None:
         cycle_stage = "insufficient_evidence"
         stage_cn = "证据不足（缺少持仓量与 ETF 资金流完整确认，不强行归入扩张/退潮）"
