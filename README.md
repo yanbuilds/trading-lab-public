@@ -6,9 +6,9 @@
 
 ---
 
-## 核心架构与验证闭环（PIIA v2.1）
+## 核心架构与验证闭环（PIIA v2.2）
 
-详见预注册协议 [PIIA_V2_PROTOCOL.md](PIIA_V2_PROTOCOL.md)、最新冻结规范 [PIIA_V2_1_FREEZE.md](PIIA_V2_1_FREEZE.md) 与真实数据正交归因报告 [PIIA_V2_EVALUATION_REPORT.md](PIIA_V2_EVALUATION_REPORT.md)：
+详见预注册协议 [PIIA_V2_PROTOCOL.md](PIIA_V2_PROTOCOL.md)、最新冻结规范 [PIIA_V2_2_FREEZE.md](PIIA_V2_2_FREEZE.md)（v2.1 记录保留于 [PIIA_V2_1_FREEZE.md](PIIA_V2_1_FREEZE.md)） 与真实数据正交归因报告 [PIIA_V2_EVALUATION_REPORT.md](PIIA_V2_EVALUATION_REPORT.md)：
 
 1. **六大公开证据支柱与严格防泄漏边界（`src/piia/intelligence/agent_v2/pillars.py`）**
    - **行情与已结算资金费**：闭合 `1h/4h/1d` K 线、因果指标、实时盘口与保证金档位；持续纸面采用 Bitget 公开 `history-fund-rate` 与周期核验，任一时点缺失标为 `funding_unknown` 且禁止宣称净收益。
@@ -19,9 +19,9 @@
 3. **正交消融实证结论摘要（如实披露，零调参，前瞻状态待完成）**
    - **`2026-11-16 06:00Z → 11-22 23:00Z` 明确重标为“历史回放，事前冻结未获独立验证”**（同提交哈希仅证文件一致）；若本地 gitignored 归档 `data/piia_v2_eval/` 无法取得，则原结果未复现（`--demo-synthetic` 仅供工程测试）。
    - 解耦 `cost_gate` 后验证：**`M2b_macro_only`（`-10.16%`，总停机）与 `M2c_stat_forecast_only`（`-10.55%`，总停机）单独均无明显减亏能力**；从 `M1` 到 `M4` 的全部回撤/换手改善均来自 **`M2a_cost_gate_only`（73 天探索期由 `-10.55%` 降至 `-4.92%`，免于停机，换手 `121.46x -> 41.92x`）**。但整体在 73 天震荡期均跑输空仓现金 `0.00%`，且在 `11-16..11-22` 回放中因高换手跑输极简 `4h EMA`（`+2.549%`）并在 `2x` 滑点转负（`-1.337%`）。
-   - **前瞻观察状态**：`v2.1.0` 于提交 `7a2b518` 后重新锁定，新周期前瞻数据尚不足以得出结论，状态保留为 **待完成（`PENDING_INSUFFICIENT_PROSPECTIVE_SAMPLE`）**。
+   - **前瞻观察状态**：`v2.2.0` 冻结后从全新真实账本重新计数；只计入冻结后、当前冻结代码按时记录的真实观测，按最长连续小时判定（要求 >= 168 连续小时，达到后也只进入待审计），当前为 **待验证（`PENDING_INSUFFICIENT_PROSPECTIVE_SAMPLE`）**。
 4. **加固版持续纸面交易双账本（`continuous_paper.py`）**
-   - 使用追加式不可篡改账本 `data/piia/piia_v2_1_continuous.sqlite`，同步追踪 `B0_cash` / `B1` / `B2` / `B3` / `M4` 的 `1x` 与 `2x` 滑点影子对照以及人工审批账本；内置停机恢复、已处理 K 线游标持久化、不溯及既往止损更新、严格资金费缺失封锁及审批前报价时效/漂移/仓位/余额/停机全重验。
+   - 真实采集只写 `data/piia/piia_v2_2_live_prospective.sqlite`、演示只写 `data/piia/piia_v2_2_demo_synthetic.sqlite`（底层按账本标签拒绝混写；旧账本只读审计：`python -m piia agent-inspect-ledger`）；三合约最新收盘不一致时整周期拒绝写入，同步追踪 `B0_cash` / `B1` / `B2` / `B3` / `M4` 的 `1x` 与 `2x` 滑点影子对照以及人工审批账本；内置停机恢复、已处理 K 线游标持久化、不溯及既往止损更新、严格资金费缺失封锁及审批前报价时效/漂移/仓位/余额/停机全重验。
 5. **🎯 个人交易辅助工具箱（`scan` / `plan-trade` / `position-advice`）**
    - 提供三大合约实时盘面雷达、下单前精确张数/含费保本价/`TP1–TP3` 分批止盈阶梯/强平缓冲工单计算器，以及盘中移动止损诊断顾问。
 
@@ -33,7 +33,7 @@ $env:PYTHONPATH = "src;."
 # 1. 核验 PIIA v2 预注册冻结规则与源码 SHA-256 完整性
 python -m piia agent-verify-freeze
 
-# 2. 执行本小时真实六支柱采集、独立研究+反方审查+确定性风控，并写入持续纸面交易账本（离线演示加 --demo）
+# 2. 执行本小时真实六支柱采集并写入真实前瞻账本（--demo 写入独立演示账本，绝不计入前瞻验证）
 python -m piia agent-run --starting-cash 500
 python -m piia agent-status
 
