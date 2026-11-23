@@ -1,0 +1,91 @@
+# Personal Investment Intelligence Agent — Traceable Judgment v3 Protocol Config.
+# Preserves PIIA v2.2.1 (74ce2ee) and Frozen Policy v1 completely unchanged as controls.
+# Judgment v3 outputs research judgment across intraday and 1-3 trading day horizons,
+# keeps formal v2.2.1 signals & paper eligibility explicitly separated, and writes only
+# to dedicated shadow ledgers (never modifying v2.2.1 or v1 ledgers).
+
+protocol_id: PIIA_TRACEABLE_JUDGMENT_V3
+version: "3.0.0"
+baseline_control_version: "2.2.1"
+baseline_commit: "74ce2eeb0c9ae759001030272fec91ec3992a415"
+prospective_freeze_started_utc: "2026-11-23T12:00:00+00:00"
+tuning_performed: false
+calibrated_probabilities: false
+live_order_permissions: false
+exchange_demo_order_permissions: false
+
+symbols:
+  - BTCUSDT
+  - XAUUSDT
+  - NDX100USDT
+
+horizons:
+  intraday:
+    label_cn: "日内 (4-12小时)"
+    outcome_horizon_hours: 6
+    news_max_age_hours: 24
+  swing_1_3d:
+    label_cn: "未来 1-3 个交易日 (24-72小时)"
+    outcome_horizon_hours: 24
+    max_holding_hours: 72
+    news_max_age_hours: 72
+
+freshness_limits:
+  ticker_max_age_minutes: 5
+  candle_1h_must_match_cutoff: true
+  dxy_intraday_max_age_minutes: 60
+  alfred_daily_max_age_days: 14
+  fear_greed_max_age_hours: 48
+  etf_complete_max_age_days: 7
+  cot_max_age_days: 14
+  onchain_tip_max_age_hours: 3
+  polymarket_book_max_age_minutes: 5
+  polymarket_max_spread: 0.05
+  news_intraday_max_age_hours: 24
+  news_swing_max_age_hours: 72
+  event_imminent_veto_hours_ahead: 2.0
+
+technical_thresholds:
+  adx_range_max: 20.0
+  adx_trend_min: 22.0
+  adx_reversal_min: 25.0
+  extreme_vol_atr_ratio: 2.2
+  rsi_oversold: 35.0
+  rsi_overbought: 65.0
+  ema_fast: 20
+  ema_slow: 50
+  sma_long: 200
+  donchian_breakout_bars: 48
+
+macro_and_tide_thresholds:
+  real_yield_5obs_bps: 12.0
+  broad_dollar_5obs_pct: 0.80
+  dxy_24h_pct: 0.50
+  net_liquidity_change_pct: 0.50
+  vix_high_level: 25.0
+  vix_low_level: 14.0
+  vix_spike_1d_pct: 12.0
+  ndx_spx_rel_5obs_pct: 0.80
+  etf_3d_outflow_musd: -150.0
+  etf_3d_inflow_musd: 150.0
+  adverse_funding_8h: 0.0003
+  oi_crowding_24h_pct: 8.0
+  fear_greed_low: 25
+  fear_greed_high: 75
+  forecast_opposing_atr_mult: 0.75
+  forecast_support_atr_mult: 0.50
+  news_primary_recent_hours: 12.0
+  news_duplicate_jaccard_min: 0.70
+
+shadow_paper:
+  starting_cash_usdt: 500.0
+  leverage: 2.0
+  risk_fraction_per_trade: 0.01
+  cash_floor_fraction: 0.20
+  max_margin_fraction: 0.50
+  taker_fee: 0.0006
+  slippage_base: 0.0005
+  slippage_stress_mult: 2.0
+  daily_loss_halt_fraction: 0.03
+  total_loss_halt_fraction: 0.10
+  prospective_min_contiguous_hours: 168

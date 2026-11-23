@@ -494,6 +494,82 @@ try:
         from piia.intelligence.research_packet import build_request, capture_paper_risk_context, import_response, write_json
         from piia.intelligence.errors import PiiaError
 
+        st.subheader("🧭 三合约多维综合判断与追问工作台 (PIIA Judgment v3 · 独立影子账本)")
+        st.caption(
+            "融合成交行情、宏观 (DXY/代理/DFII10/日历事件)、三层潮汐、情绪资金流 (ETF/COT/VIX/EDGAR/链上/Polymarket)、已核验新闻与模型预测。"
+            "严格保留 PIIA v2.2.1 对照不变；所有结果区分纯技术面、综合判断与正式开仓资格，不自动下单。"
+        )
+        try:
+            import pandas as _jv3_pd
+            from piia.intelligence.judgment.chat_workbench import answer_judgment_query, build_summary_table_rows
+            from piia.intelligence.judgment.evaluation import (
+                default_judgment_ledger_path,
+                get_judgment_ledger_status,
+                load_latest_two_packets,
+                log_chat_qa,
+                record_judgment_cycle,
+            )
+            jv3_c1, jv3_c2, jv3_c3 = st.columns([1.2, 1.2, 1.0])
+            jv3_mode = jv3_c3.radio("Judgment v3 账本", ["真实影子账本", "合成演示账本"], horizontal=True, key="jv3_mode_sel")
+            jv3_demo = jv3_mode == "合成演示账本"
+            jv3_db = default_judgment_ledger_path(demo=jv3_demo)
+            if jv3_c1.button("📡 采集今日公开多维证据并生成判断", key="jv3_btn_live"):
+                with st.spinner("正在拉取三合约、宏观、事件、ETF/COT/VIX、SEC EDGAR、官方新闻并运行综合规则..."):
+                    res_j3 = record_judgment_cycle(db_path=default_judgment_ledger_path(demo=False), demo_mode=False)
+                st.session_state["jv3_last_record"] = res_j3
+                st.success(f"已生成并存入真实影子账本（截止 `{res_j3['cutoff_utc']}` | hash `{res_j3['judgment_hash'][:12]}`）")
+            if jv3_c2.button("🧪 生成离线演示综合判断 (独立账本)", key="jv3_btn_demo"):
+                res_j3d = record_judgment_cycle(db_path=default_judgment_ledger_path(demo=True), demo_mode=True)
+                st.session_state["jv3_last_record"] = res_j3d
+                st.info(f"已写入独立演示账本（cutoff `{res_j3d['cutoff_utc']}` | SYNTHETIC DEMO）")
+
+            jv3_status = get_judgment_ledger_status(jv3_db, demo=jv3_demo)
+            jv3_cur, jv3_prev = load_latest_two_packets(jv3_db)
+            if jv3_cur:
+                st.caption(
+                    f"验证状态: **{jv3_status['validation_status']}** — {jv3_status['validation_note']} | "
+                    f"快照截止 UTC: `{jv3_cur['cutoff_utc']}` | 已用因子: {len(jv3_cur['audit_coverage']['factors_used'])} | "
+                    f"缺失因子: {len(jv3_cur['audit_coverage']['factors_missing'])} | 剔除未来/过期: {len(jv3_cur['audit_coverage']['factors_excluded'])}"
+                )
+                tbl = build_summary_table_rows(jv3_cur)
+                st.dataframe(_jv3_pd.DataFrame(tbl), width="stretch")
+                with st.expander("🌊 宏观传导解释、三层潮汐、预测与新闻核验明细", expanded=False):
+                    st.write("**黄金 vs 纳指宏观分化机制：**", jv3_cur["macro_summary"]["gold_vs_ndx_divergence_note"])
+                    st.write("**潮汐大环境：**", jv3_cur["tide"]["macro_backdrop"]["state_cn"])
+                    st.write("**当前市场阶段：**", jv3_cur["tide"]["cycle_stage"]["stage_cn"])
+                    st.json({
+                        "macro_summary": {k: v for k, v in jv3_cur["macro_summary"].items() if k != "events"},
+                        "forecast_and_models": jv3_cur["forecast_and_models"],
+                        "news_audit_top6": jv3_cur.get("news_audit", [])[:6],
+                    })
+
+                jv3_q = st.text_input(
+                    "直接向当前证据快照提问 / 追问",
+                    value="今天黄金、BTC、纳指 100 看多还是看空？",
+                    key="jv3_question_input",
+                )
+                q_c1, q_c2, q_c3, q_c4 = st.columns(4)
+                asked_q = None
+                if q_c1.button("💬 提交问题", key="jv3_btn_ask"):
+                    asked_q = jv3_q
+                if q_c2.button("❓ 为什么不做空？", key="jv3_btn_why"):
+                    asked_q = "为什么不做空？"
+                if q_c3.button("💵 如果美元上升会改判吗？", key="jv3_btn_whatif"):
+                    asked_q = "如果美元上升会改判吗？"
+                if q_c4.button("🔄 相比上次，哪条证据变了？", key="jv3_btn_diff"):
+                    asked_q = "相比上次，哪条证据变了？"
+                if asked_q:
+                    qa_ans = answer_judgment_query(asked_q, packet=jv3_cur, previous_packet=jv3_prev)
+                    log_chat_qa(jv3_db, qa_ans)
+                    st.session_state["jv3_last_qa"] = qa_ans
+                if st.session_state.get("jv3_last_qa"):
+                    st.markdown(st.session_state["jv3_last_qa"]["markdown"])
+            else:
+                st.info("当前所选账本尚无 Judgment v3 快照；点击上方按钮即可生成首次三合约双期限综合判断。")
+        except Exception as exc_jv3:
+            st.warning(f"Judgment v3 工作台加载异常：{exc_jv3}")
+        st.divider()
+
         st.subheader("聊天辅助研究")
         st.caption("冻结公开数据后分析；研究方和反方可使用同一模型的独立请求上下文，不代表独立模型。不会自动批准或下单。")
         with st.expander("前瞻纸面对照（本地报告）"):
