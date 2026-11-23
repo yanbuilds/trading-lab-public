@@ -14,13 +14,13 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[4]
 
 PINNED_SHA256 = {
-    "PIIA_V2_PROTOCOL.md": "48bb560d684764295484d849f00f5bbcda1c6fb92fabdcad172277c68773c33c",
-    "config/piia_agent_v2.yaml": "57a0a768a062065d4ec3b3c7992726744175db91a2a823487205cbe00da611c7",
-    "src/piia/intelligence/agent_v2/pillars.py": "bac65ec297e587d761c8bc92cd312d0cf9ec2373682450718b46f937f8eb549e",
-    "src/piia/intelligence/agent_v2/roles.py": "befdcbfb9a20f81ca1ff11ef5b7734a0c39d4e3b90781f98d53b6d392acf4567",
-    "src/piia/intelligence/agent_v2/risk_gate.py": "63d666592b6ddcaa5fc416ba6f027a54fac591017244d1df25dc44911ec4d20a",
-    "src/piia/intelligence/agent_v2/ablation.py": "9b8f77d5a320524c94df61151c4e3596863a2e1506aee161d756326afd0a41b5",
-    "src/piia/intelligence/agent_v2/continuous_paper.py": "db9754a70ae448c718fd4fdbb011ca380ee82745315ab6bc20a700bfe4f99ed5",
+    "PIIA_V2_PROTOCOL.md": "45f702ec4b53d62377d2c0da94b7568d218dfc547248eb4f7cf946ccffa96e32",
+    "config/piia_agent_v2.yaml": "967ac9efa76bc74be0865fc2f68857557f3b0e814e6ce928c6401357a438e25f",
+    "src/piia/intelligence/agent_v2/pillars.py": "2984e74a7816f1ca4ce46180ed2027c2589c99a7f8a9ca3c1b2d2711b02f3988",
+    "src/piia/intelligence/agent_v2/roles.py": "f25d2999577ec5243ef9e75218380261c5eab0219ce7550be52b137652d71804",
+    "src/piia/intelligence/agent_v2/risk_gate.py": "e15bea45dc60088e177a3ce49a7281b90ffb26202c0d08ab27c58507f77bfead",
+    "src/piia/intelligence/agent_v2/ablation.py": "4876a358f9a4522b8bd54a3fc8fec2d112fd83740d3c3e7ac316fcb632a30921",
+    "src/piia/intelligence/agent_v2/continuous_paper.py": "6b40ae73e60d36a20268dcdc82f562f7cf1dbc6bc1794e200422693a86695f08",
 }
 
 

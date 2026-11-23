@@ -311,8 +311,14 @@ def main(argv: list[str] | None = None) -> int:
         specs_override = {}
         prov = {"kind": "SYNTHETIC_OFFLINE_DEMO_NOT_REAL_MARKET", "files_sha256": {"synthetic": "demo"}}
     else:
-        if args.fetch_public or not (args.data_dir / "provenance_v2.json").is_file():
+        if args.fetch_public:
             fetch_eval_dataset(args.data_dir)
+        elif not (args.data_dir / "provenance_v2.json").is_file():
+            raise SystemExit(
+                "Archived local evaluation dataset not present (gitignored per AGENTS.md); "
+                "original v2.0.0 slice is not reproduced from Git alone. "
+                "Pass --fetch-public for current public window or --demo-synthetic for engineering test only."
+            )
         frames, funding, intervals, macro_obs, specs_override, prov = load_eval_dataset(args.data_dir)
 
     dataset_hash = hashlib.sha256(json.dumps(prov.get("files_sha256", {}), sort_keys=True).encode("utf-8")).hexdigest()
@@ -348,25 +354,41 @@ def main(argv: list[str] | None = None) -> int:
         "common_last_utc": str(last_common),
         "tuning_performed_after_freeze": False,
         "live_orders_submitted": False,
+        "is_synthetic_engineering_test": bool(args.demo_synthetic),
+        "module_execution_summary": {
+            "deterministic_research_rule": {"executed": True, "basis": "causal 1h/4h OHLCV indicators"},
+            "deterministic_critic_cost_gate": {"executed": True, "basis": "ATR/friction ratio, volatility regime, funding crowding, 4h conflict"},
+            "macro_alfred_lagged_filter": {"executed": bool(macro_obs), "basis": "ALFRED daily series with conservative +2 UTC day lag"},
+            "statistical_drift_forecast_168h": {"executed": True, "basis": "causal 168h log-return drift & sigma*sqrt(24) band"},
+            "neural_chronos_model": {"executed": False, "basis": "Chronos neural weights not executed in historical ablation"},
+            "official_llm_review": {"executed": False, "status": "NOT_WIRED"},
+            "contemporaneous_live_pillars": {"executed": False, "basis": "ETF flows / COT / mempool / Polymarket unavailable point-in-time in historical replay"},
+        },
         "windows": {},
     }
 
-    # Window 1: UNSEEN POST-2026-11-16 HOLDOUT
+    # Window 1: Post-2026-11-16 Replay Window (pre-freeze timing NOT independently verified)
     holdout_bars = [t for t in common if t >= holdout_boundary]
     if len(holdout_bars) >= 24:
         h_start, h_end = holdout_bars[0], holdout_bars[-1]
         h_fund_cov = _check_funding_coverage(funding, intervals, h_start, h_end)
         report["windows"]["unseen_post_2026_11_16_holdout"] = {
-            "label": "UNSEEN_POST_FREEZE_HOLDOUT",
+            "label": "SYNTHETIC_ENGINEERING_TEST" if args.demo_synthetic else "HISTORICAL_REPLAY_PRE_FREEZE_TIMING_UNVERIFIED",
+            "timing_independently_verified": False,
+            "note": (
+                "Synthetic fixture for software verification only; never empirical evidence."
+                if args.demo_synthetic
+                else "历史回放，事前冻结未获独立验证：同提交哈希仅证明文件一致，非独立事前时间戳证明。"
+            ),
             "bars_count": len(holdout_bars),
             "funding_coverage": h_fund_cov,
             "book_100u": run_ablation_tournament(
-                frames, start=h_start, end=h_end, starting_cash=100.0, held_out=True,
+                frames, start=h_start, end=h_end, starting_cash=100.0, held_out=False,
                 market_data_hash=dataset_hash, funding=funding, funding_complete=h_fund_cov["complete"],
                 macro_observations=macro_obs, specs_override=specs_override, cfg=cfg,
             ),
             "book_500u": run_ablation_tournament(
-                frames, start=h_start, end=h_end, starting_cash=500.0, held_out=True,
+                frames, start=h_start, end=h_end, starting_cash=500.0, held_out=False,
                 market_data_hash=dataset_hash, funding=funding, funding_complete=h_fund_cov["complete"],
                 macro_observations=macro_obs, specs_override=specs_override, cfg=cfg,
             ),
@@ -407,10 +429,10 @@ def main(argv: list[str] | None = None) -> int:
         s_end = full_eval_bars[pos_idx + slice_len - 1]
         s_cov = _check_funding_coverage(funding, intervals, s_start, s_end)
         s_res = run_ablation_tournament(
-            frames, start=s_start, end=s_end, starting_cash=500.0, held_out=(s_start >= holdout_boundary),
+            frames, start=s_start, end=s_end, starting_cash=500.0, held_out=False,
             market_data_hash=dataset_hash, funding=funding, funding_complete=s_cov["complete"],
             macro_observations=macro_obs, specs_override=specs_override,
-            arms=("B0_cash", "B1_simple_ema_1h", "B3_donchian_breakout_4h", "M1_researcher_market_only", "M4_full_piia_v2"),
+            arms=("B0_cash", "B1_simple_ema_1h", "B2_aligned_ema_4h", "B3_donchian_breakout_4h", "M1_researcher_market_only", "M2a_plus_cost_gate_only", "M4_full_piia_v2"),
             include_2x_cost_stress=False, cfg=cfg,
         )
         wf_slices.append({
@@ -421,6 +443,9 @@ def main(argv: list[str] | None = None) -> int:
             "returns_pct_500u": {k: v["return_pct"] for k, v in s_res["base_cost_results"].items()},
             "max_dd_pct_500u": {k: v["max_drawdown_pct"] for k, v in s_res["base_cost_results"].items()},
             "trades_500u": {k: v["closed_trades"] for k, v in s_res["base_cost_results"].items()},
+            "turnover_multiple_500u": {k: v["turnover_multiple"] for k, v in s_res["base_cost_results"].items()},
+            "exposure_bar_fraction_500u": {k: v["exposure_bar_fraction"] for k, v in s_res["base_cost_results"].items()},
+            "loss_halt_500u": {k: v["loss_halt_reason"] for k, v in s_res["base_cost_results"].items()},
         })
         pos_idx += slice_len
         slice_num += 1

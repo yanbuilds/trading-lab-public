@@ -55,10 +55,25 @@ ARMS_ORDER = (
     "B3_donchian_breakout_4h",
     "B4_v1_range_bollinger",
     "M1_researcher_market_only",
-    "M2_plus_macro_vintage",
-    "M3_plus_forecast_module",
+    "M2a_plus_cost_gate_only",
+    "M2b_plus_macro_only",
+    "M2c_plus_stat_forecast_only",
+    "M3a_cost_plus_macro",
+    "M3b_cost_plus_stat_forecast",
+    "M3c_macro_plus_stat_forecast",
     "M4_full_piia_v2",
 )
+
+M_SWITCH_MATRIX: dict[str, tuple[bool, bool, bool]] = {
+    "M1_researcher_market_only": (False, False, False),
+    "M2a_plus_cost_gate_only": (True, False, False),
+    "M2b_plus_macro_only": (False, True, False),
+    "M2c_plus_stat_forecast_only": (False, False, True),
+    "M3a_cost_plus_macro": (True, True, False),
+    "M3b_cost_plus_stat_forecast": (True, False, True),
+    "M3c_macro_plus_stat_forecast": (False, True, True),
+    "M4_full_piia_v2": (True, True, True),
+}
 
 
 def _baseline_candidate_from_row(
@@ -141,6 +156,7 @@ def simulate_single_arm(
     starting_cash: float = 100.0,
     slippage: float | None = None,
     funding: dict[str, list[dict[str, Any]]] | None = None,
+    funding_complete: bool = True,
     macro_observations: dict[str, list[dict[str, Any]]] | None = None,
     specs_override: dict[str, dict[str, Any]] | None = None,
     cfg: dict[str, Any] | None = None,
@@ -178,7 +194,10 @@ def simulate_single_arm(
     traces_sample: list[dict[str, Any]] = []
     fees_paid = 0.0
     funding_paid = 0.0
+    turnover_notional = 0.0
+    notional_exposure_sum = 0.0
     kill = False
+    halt_reason: str | None = None
     day = None
     day_start = cash
     bars_in_pos = 0
@@ -193,16 +212,18 @@ def simulate_single_arm(
         return macro_by_day[d_key]
 
     def _close_position(raw_px: float, ts_exit: pd.Timestamp, reason: str) -> None:
-        nonlocal cash, pos, fees_paid
+        nonlocal cash, pos, fees_paid, turnover_notional
         assert pos is not None
         sp = v1_specs[pos["symbol"]]
         side_i = 1 if pos["side"] == "long" else -1
         qty = pos["qty"]
         fill_px = raw_px * (1.0 - side_i * slip)
-        exit_fee = qty * sp.contract_size * fill_px * sp.taker
+        exit_notional = qty * sp.contract_size * fill_px
+        exit_fee = exit_notional * sp.taker
         gross = exit_pnl(side_i, qty, pos["entry"], fill_px, sp)
         cash += gross - exit_fee
         fees_paid += exit_fee
+        turnover_notional += exit_notional
         closed_trades.append({
             "symbol": pos["symbol"],
             "side": pos["side"],
@@ -315,14 +336,24 @@ def simulate_single_arm(
             exit_pnl(1 if pos["side"] == "long" else -1, pos["qty"], pos["entry"], float(rows_now[pos["symbol"]]["open"]), v1_specs[pos["symbol"]])
             if pos is not None else 0.0
         )
-        if eq_open <= day_start * (1.0 - daily_halt) or eq_open <= starting_cash * (1.0 - total_halt):
+        if eq_open <= starting_cash * (1.0 - total_halt):
+            if not kill:
+                halt_reason = "total_loss_halt_10pct"
+            kill = True
+        elif eq_open <= day_start * (1.0 - daily_halt):
+            if not kill:
+                halt_reason = "daily_loss_halt_3pct"
             kill = True
 
         # 2. Evaluate new entry candidates when flat and not halted
         pos_at_open = pos is not None
         if pos is None and not kill and arm != "B0_cash":
             decision_utc = ts.to_pydatetime()  # prev_ts bar closes at `ts`!
-            macro_ctx = _get_macro(decision_utc) if arm in {"M2_plus_macro_vintage", "M4_full_piia_v2"} else None
+            if arm in M_SWITCH_MATRIX:
+                en_cost, en_macro, en_fc = M_SWITCH_MATRIX[arm]
+            else:
+                en_cost, en_macro, en_fc = False, False, False
+            macro_ctx = _get_macro(decision_utc) if en_macro else None
 
             actionable_traces: list[tuple[float, str, dict[str, Any]]] = []
             for sym in sorted(prepared_tables):
@@ -369,10 +400,8 @@ def simulate_single_arm(
                     else:
                         stand_aside_counts[str(risk_res["stand_aside_reason"])] += 1
                 else:
-                    # PIIA v2 Module Ablation Arms (`M1`..`M4`)
-                    en_macro = arm in {"M2_plus_macro_vintage", "M4_full_piia_v2"}
-                    en_fc = arm in {"M3_plus_forecast_module", "M4_full_piia_v2"}
-                    en_critic = arm in {"M2_plus_macro_vintage", "M3_plus_forecast_module", "M4_full_piia_v2"}
+                    if arm not in M_SWITCH_MATRIX:
+                        raise ValueError(f"Unknown ablation arm: {arm}")
                     bundle = build_bar_evidence_for_symbol(
                         sym,
                         feature_row=sig_row,
@@ -381,56 +410,22 @@ def simulate_single_arm(
                         funding_rate_8h=last_f_rate,
                         macro_ctx=macro_ctx if en_macro else None,
                     )
-                    # Note: for M2 (macro only) & M3 (forecast only), isolate veto to ONLY that module vs M4 full critic!
-                    if arm == "M4_full_piia_v2":
-                        trace = run_symbol_decision_trace(
-                            bundle,
-                            equity_usdt=cash,
-                            free_cash_usdt=cash,
-                            open_positions_count=0,
-                            kill_switch_halted=kill,
-                            planned_entry_price=next_open_px,
-                            slippage_override=slip,
-                            spec_override=(specs_override or {}).get(sym),
-                            enable_macro=True,
-                            enable_forecast=True,
-                            enable_critic_veto=True,
-                            enable_live_external=False,
-                            cfg=cfg,
-                        )
-                    elif arm == "M1_researcher_market_only":
-                        trace = run_symbol_decision_trace(
-                            bundle,
-                            equity_usdt=cash,
-                            free_cash_usdt=cash,
-                            open_positions_count=0,
-                            kill_switch_halted=kill,
-                            planned_entry_price=next_open_px,
-                            slippage_override=slip,
-                            spec_override=(specs_override or {}).get(sym),
-                            enable_macro=False,
-                            enable_forecast=False,
-                            enable_critic_veto=False,
-                            enable_live_external=False,
-                            cfg=cfg,
-                        )
-                    else:
-                        # M2 or M3: run trace with only macro or only forecast enabled, filtering critic veto to that module
-                        trace = run_symbol_decision_trace(
-                            bundle,
-                            equity_usdt=cash,
-                            free_cash_usdt=cash,
-                            open_positions_count=0,
-                            kill_switch_halted=kill,
-                            planned_entry_price=next_open_px,
-                            slippage_override=slip,
-                            spec_override=(specs_override or {}).get(sym),
-                            enable_macro=en_macro,
-                            enable_forecast=en_fc,
-                            enable_critic_veto=True,
-                            enable_live_external=False,
-                            cfg=cfg,
-                        )
+                    trace = run_symbol_decision_trace(
+                        bundle,
+                        equity_usdt=cash,
+                        free_cash_usdt=cash,
+                        open_positions_count=0,
+                        kill_switch_halted=kill,
+                        planned_entry_price=next_open_px,
+                        slippage_override=slip,
+                        spec_override=(specs_override or {}).get(sym),
+                        enable_cost_gate=en_cost,
+                        enable_macro_filter=en_macro,
+                        enable_stat_forecast_filter=en_fc,
+                        enable_neural_forecast_filter=False,
+                        enable_live_external=False,
+                        cfg=cfg,
+                    )
                     for vr in trace["critic_adversarial_pass2"]["veto_reasons"]:
                         veto_counts[vr] += 1
                     if record_traces and (trace["final_action"] in {"long", "short"} or trace["critic_adversarial_pass2"]["vetoed"]):
@@ -459,6 +454,7 @@ def simulate_single_arm(
                 entry_fee = float(cr["entry_taker_fee_usdt"])
                 cash -= entry_fee
                 fees_paid += entry_fee
+                turnover_notional += float(sz["notional_usdt"])
                 pos = {
                     "symbol": chosen_sym,
                     "side": sz["side"],
@@ -500,8 +496,18 @@ def simulate_single_arm(
             exit_pnl(1 if pos["side"] == "long" else -1, pos["qty"], pos["entry"], float(rows_now[pos["symbol"]]["close"]), v1_specs[pos["symbol"]])
             if pos is not None else 0.0
         )
+        if pos is not None and eq_close > 0:
+            c_px = float(rows_now[pos["symbol"]]["close"])
+            sp_c = v1_specs[pos["symbol"]]
+            notional_exposure_sum += (pos["qty"] * sp_c.contract_size * c_px) / eq_close
         nav.append((str(ts + pd.Timedelta(hours=1)), eq_close))
-        if eq_close <= day_start * (1.0 - daily_halt) or eq_close <= starting_cash * (1.0 - total_halt):
+        if eq_close <= starting_cash * (1.0 - total_halt):
+            if not kill:
+                halt_reason = "total_loss_halt_10pct"
+            kill = True
+        elif eq_close <= day_start * (1.0 - daily_halt):
+            if not kill:
+                halt_reason = "daily_loss_halt_3pct"
             kill = True
         if kill and pos is not None:
             _close_position(float(rows_now[pos["symbol"]]["close"]), ts + pd.Timedelta(hours=1), "loss_halt")
@@ -525,11 +531,37 @@ def simulate_single_arm(
     if len(rets_h) > 10 and float(rets_h.std()) > 1e-12:
         sharpe = round(float(rets_h.mean() / rets_h.std() * math.sqrt(8760)), 3)
 
+    ret_pct = round((final_eq / starting_cash - 1.0) * 100.0, 4)
+    if arm in M_SWITCH_MATRIX:
+        sw_cost, sw_mac, sw_fc = M_SWITCH_MATRIX[arm]
+        active_switches = {
+            "deterministic_research_rule": True,
+            "cost_gate": sw_cost,
+            "macro_filter": sw_mac,
+            "stat_forecast_filter": sw_fc,
+            "neural_chronos_model": False,
+            "official_llm_review": False,
+            "contemporaneous_live_pillars": False,
+        }
+    else:
+        active_switches = {
+            "deterministic_research_rule": False,
+            "cost_gate": False,
+            "macro_filter": False,
+            "stat_forecast_filter": False,
+            "neural_chronos_model": False,
+            "official_llm_review": False,
+            "contemporaneous_live_pillars": False,
+        }
+
     return {
         "arm": arm,
+        "active_switches": active_switches,
         "initial_usdt": starting_cash,
         "final_usdt": round(final_eq, 4),
-        "return_pct": round((final_eq / starting_cash - 1.0) * 100.0, 4),
+        "return_pct": ret_pct,
+        "net_return_pct": ret_pct if funding_complete else None,
+        "net_performance_claim_permitted": bool(funding_complete),
         "max_drawdown_pct": round(float((1.0 - eq_s / eq_s.cummax()).max() * 100.0), 4),
         "annualized_sharpe_hourly_proxy": sharpe,
         "closed_trades": len(closed_trades),
@@ -538,10 +570,14 @@ def simulate_single_arm(
         "winrate_pct": round(100.0 * len(wins) / len(pnls), 2) if pnls else None,
         "fees_paid_usdt": round(fees_paid, 4),
         "funding_net_paid_usdt": round(funding_paid, 4),
+        "turnover_notional_usdt": round(turnover_notional, 2),
+        "turnover_multiple": round(turnover_notional / starting_cash, 4) if starting_cash > 0 else 0.0,
         "open_positions_end": int(pos is not None),
         "open_unrealized_usdt": round(open_unrealized, 4),
         "exposure_bar_fraction": round(bars_in_pos / len(eval_bars), 4) if eval_bars else 0.0,
+        "avg_notional_exposure_ratio": round(notional_exposure_sum / len(eval_bars), 4) if eval_bars else 0.0,
         "loss_halt_triggered": bool(kill),
+        "loss_halt_reason": halt_reason,
         "reconciliation_error": recon_err,
         "trades_by_symbol": dict(Counter(t["symbol"] for t in closed_trades)),
         "exit_reasons": dict(Counter(t["exit_reason"] for t in closed_trades)),
@@ -590,6 +626,7 @@ def run_ablation_tournament(
             starting_cash=starting_cash,
             slippage=base_slip,
             funding=funding,
+            funding_complete=funding_complete,
             macro_observations=macro_observations,
             specs_override=specs_override,
             cfg=cfg,
@@ -610,6 +647,7 @@ def run_ablation_tournament(
                 starting_cash=starting_cash,
                 slippage=base_slip * stress_mult,
                 funding=funding,
+                funding_complete=funding_complete,
                 macro_observations=macro_observations,
                 specs_override=specs_override,
                 cfg=cfg,
@@ -618,10 +656,16 @@ def run_ablation_tournament(
             results_stress[arm] = {
                 "final_usdt": st_res["final_usdt"],
                 "return_pct": st_res["return_pct"],
+                "net_return_pct": st_res["net_return_pct"],
                 "max_drawdown_pct": st_res["max_drawdown_pct"],
                 "closed_trades": st_res["closed_trades"],
                 "fees_paid_usdt": st_res["fees_paid_usdt"],
+                "turnover_notional_usdt": st_res["turnover_notional_usdt"],
+                "turnover_multiple": st_res["turnover_multiple"],
+                "exposure_bar_fraction": st_res["exposure_bar_fraction"],
+                "avg_notional_exposure_ratio": st_res["avg_notional_exposure_ratio"],
                 "loss_halt_triggered": st_res["loss_halt_triggered"],
+                "loss_halt_reason": st_res["loss_halt_reason"],
             }
 
         comparison_declarations.append({

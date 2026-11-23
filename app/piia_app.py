@@ -89,25 +89,33 @@ try:
         else:
             st.error(f"🚨 冻结校验未通过：{fz['issues']} — 持续前瞻纸面与样本外声明已自动阻断。")
 
-        with st.expander("📊 样本外留出集 (Post-2026-11-16) 与模块消融对照报告", expanded=True):
+        with st.expander("📊 历史回放对照与正交模块消融报告（2026-11-16..11-22 事前冻结未获独立验证）", expanded=True):
             oos_path = _AG2_ROOT / "artifacts" / "piia_v2_oos_ablation.json"
             if not oos_path.is_file():
-                st.info("尚未在本地生成 `artifacts/piia_v2_oos_ablation.json`；可运行 `python -m experiments.run_piia_v2_oos_ablation --fetch-public`。")
+                st.info("尚未在本地生成 `artifacts/piia_v2_oos_ablation.json`（历史归档不包含在 Git 中）；可运行 `python -m experiments.run_piia_v2_oos_ablation --fetch-public` 获取当前公开数据或 `--demo-synthetic` 做工程检验。")
             else:
                 try:
                     oos_doc = _ag2_json.loads(oos_path.read_text(encoding="utf-8"))
                     la_ok = (oos_doc.get("prefix_truncation_lookahead_audit") or {}).get("ok")
                     st.caption(
-                        f"评估生成时间 UTC: {oos_doc.get('evaluated_at_utc')} | 数据集哈希: `{str(oos_doc.get('dataset_sha256'))[:16]}...` | "
+                        f"版本: `v{oos_doc.get('version')}` | 生成时间 UTC: {oos_doc.get('evaluated_at_utc')} | 数据集哈希: `{str(oos_doc.get('dataset_sha256'))[:16]}...` | "
                         f"前缀截断无前视检验: `{'PASS' if la_ok else 'UNVERIFIED'}` | 冻结后调参: `{oos_doc.get('tuning_performed_after_freeze')}`"
                     )
+                    if oos_doc.get("module_execution_summary"):
+                        st.caption("模块执行核验：" + ", ".join(
+                            f"{k}={'已运行' if v.get('executed') else '未运行'}"
+                            for k, v in oos_doc["module_execution_summary"].items()
+                        ))
                     win_sel = st.selectbox(
                         "选择评估窗口",
                         list((oos_doc.get("windows") or {}).keys()),
                         key="ag2_win_sel",
                     )
                     book_sel = st.selectbox("选择独立本金账本", ["book_100u", "book_500u"], index=1, key="ag2_book_sel")
-                    win_obj = ((oos_doc.get("windows") or {}).get(win_sel) or {}).get(book_sel) or {}
+                    win_meta = (oos_doc.get("windows") or {}).get(win_sel) or {}
+                    if win_meta.get("note"):
+                        st.warning(f"{win_meta.get('label', '')}: {win_meta['note']}")
+                    win_obj = win_meta.get(book_sel) or {}
                     base_res = win_obj.get("base_cost_results") or {}
                     stress_res = win_obj.get("stress_2x_slippage_results") or {}
                     if base_res:
@@ -115,17 +123,18 @@ try:
                         for arm_k, item in base_res.items():
                             st_item = stress_res.get(arm_k) or {}
                             tbl.append({
-                                "实验臂 (基线 / 消融)": arm_k,
+                                "实验臂 (基线 / 正交开关)": arm_k,
                                 "期末权益(U)": item.get("final_usdt"),
-                                "净收益率(%)": item.get("return_pct"),
+                                "净收益率(%)": item.get("net_return_pct") if item.get("net_return_pct") is not None else "未知(缺资金费)",
                                 "最大回撤(%)": item.get("max_drawdown_pct"),
-                                "2x滑点压力收益(%)": st_item.get("return_pct"),
+                                "2x滑点压力收益(%)": st_item.get("net_return_pct") if st_item.get("net_return_pct") is not None else st_item.get("return_pct"),
                                 "平仓笔数": item.get("closed_trades"),
-                                "胜率(%)": item.get("winrate_pct"),
+                                "持仓时间占比": item.get("exposure_bar_fraction"),
+                                "平均名义敞口倍数": item.get("avg_notional_exposure_ratio"),
+                                "换手倍数": item.get("turnover_multiple"),
                                 "手续费(U)": item.get("fees_paid_usdt"),
                                 "资金费净支出(U)": item.get("funding_net_paid_usdt"),
-                                "持仓时间占比": item.get("exposure_bar_fraction"),
-                                "触发停机": item.get("loss_halt_triggered"),
+                                "停机状态": item.get("loss_halt_reason") or ("停机" if item.get("loss_halt_triggered") else "正常"),
                             })
                         st.dataframe(_ag2_pd.DataFrame(tbl), width="stretch")
                 except Exception as exc:
@@ -152,21 +161,31 @@ try:
 
         cp_status = get_continuous_paper_status()
         if not cp_status.get("initialized"):
-            st.info("本地持续纸面账本 (`data/piia/piia_v2_continuous.sqlite`) 尚无记录；点击上方按钮即可记录首个可追溯周期。")
+            st.info("本地持续纸面账本 (`data/piia/piia_v2_1_continuous.sqlite`) 尚无记录；点击上方按钮即可在 v2.1 冻结规则下记录首个可追溯前瞻周期。")
         else:
             st.caption(
+                f"前瞻状态: **{cp_status.get('validation_status')}** — {cp_status.get('validation_note', '')} | "
                 f"已累计记录前瞻周期数: **{cp_status['cycles_recorded']}** | 首周期: `{cp_status['first_cutoff_utc']}` | "
                 f"最新周期: `{cp_status['latest_cutoff_utc']}` (`{cp_status['latest_mode']}`)"
             )
             b_rows = []
             for b_k, b_v in (cp_status.get("books") or {}).items():
                 op = b_v.get("open_position")
+                net_disp = (
+                    b_v["realized_net_pnl_usdt"]
+                    if b_v.get("net_return_claim_allowed", True)
+                    else "未知(缺已核验资金费)"
+                )
                 b_rows.append({
                     "对照账本": b_k,
                     "初始资金(U)": b_v["starting_cash_usdt"],
                     "当前现金(U)": b_v["cash_usdt"],
                     "已平仓笔数": b_v["closed_trades"],
-                    "已实现净损益(U)": b_v["realized_net_pnl_usdt"],
+                    "已实现净损益(U)": net_disp,
+                    "已知资金费(U)": b_v.get("known_funding_paid_usdt"),
+                    "资金费完整": b_v.get("funding_complete"),
+                    "停机锁定": b_v.get("halt_reason") or ("停机" if b_v.get("halted") else "正常"),
+                    "对账误差": b_v.get("reconciliation_error_usdt"),
                     "当前持仓": f"{op['symbol']} {op['side']} {op['qty']}@{op['entry']:.2f} (SL={op['stop']:.2f})" if op else "空仓",
                 })
             st.dataframe(_ag2_pd.DataFrame(b_rows), width="stretch")
@@ -178,6 +197,7 @@ try:
                 ):
                     st.write("保留的角色分歧 (Disagreements):", tr_d.get("disagreements") or ["无分歧"])
                     st.json({
+                        "module_execution": tr_d.get("module_execution"),
                         "entry_plan": tr_d.get("entry_plan"),
                         "exit_plan": tr_d.get("exit_plan"),
                         "position_sizing": tr_d.get("position_sizing"),

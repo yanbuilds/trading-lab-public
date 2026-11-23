@@ -318,19 +318,41 @@ def run_symbol_decision_trace(
     planned_entry_price: float | None = None,
     slippage_override: float | None = None,
     spec_override: dict[str, Any] | None = None,
-    enable_macro: bool = True,
-    enable_forecast: bool = True,
-    enable_critic_veto: bool = True,
+    enable_cost_gate: bool | None = None,
+    enable_macro_filter: bool | None = None,
+    enable_stat_forecast_filter: bool | None = None,
+    enable_neural_forecast_filter: bool = False,
+    enable_macro: bool | None = None,
+    enable_forecast: bool | None = None,
+    enable_critic_veto: bool | None = None,
     enable_live_external: bool = True,
     cfg: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Execute full isolated Researcher -> Critic -> Synthesizer -> Risk Gate for one symbol."""
     cfg = cfg or load_v2_config()
+    use_cost_gate = (
+        enable_cost_gate
+        if enable_cost_gate is not None
+        else (True if enable_critic_veto is None else bool(enable_critic_veto))
+    )
+    use_macro = (
+        enable_macro_filter
+        if enable_macro_filter is not None
+        else (True if enable_macro is None else bool(enable_macro))
+    )
+    use_stat_fc = (
+        enable_stat_forecast_filter
+        if enable_stat_forecast_filter is not None
+        else (True if enable_forecast is None else bool(enable_forecast))
+    )
+    use_neural_fc = bool(enable_neural_forecast_filter)
+
     researcher_out = run_independent_researcher(
         bundle,
         cfg=cfg,
-        enable_macro=enable_macro,
-        enable_forecast=enable_forecast,
+        enable_macro=use_macro,
+        enable_stat_forecast=use_stat_fc,
+        enable_neural_forecast=use_neural_fc,
         enable_live_external=enable_live_external,
     )
     critic_pass1 = run_independent_critic_pass1(bundle, cfg=cfg)
@@ -339,9 +361,10 @@ def run_symbol_decision_trace(
         researcher_out,
         critic_pass1,
         cfg=cfg,
-        enable_macro=enable_macro,
-        enable_forecast=enable_forecast,
-        enable_critic_veto=enable_critic_veto,
+        enable_cost_gate=use_cost_gate,
+        enable_macro_filter=use_macro,
+        enable_stat_forecast_filter=use_stat_fc,
+        enable_neural_forecast_filter=use_neural_fc,
         enable_live_external=enable_live_external,
     )
     synth_out = run_synthesizer(bundle, researcher_out, critic_pass1, critic_veto)
@@ -359,13 +382,36 @@ def run_symbol_decision_trace(
         cfg=cfg,
     )
 
+    mac_pillar = bundle["pillars"]["macro"]
+    fc_pillar = bundle["pillars"]["forecast"]
+    stat_ok = bool((fc_pillar.get("statistical_drift") or {}).get("available"))
+    neural_ok = bool((fc_pillar.get("neural_chronos") or {}).get("available"))
+    module_execution = {
+        "deterministic_research_rule": "executed",
+        "deterministic_critic_cost_gate": "executed" if use_cost_gate else "disabled",
+        "macro_alfred_lagged_filter": (
+            "executed" if (use_macro and mac_pillar.get("status") == "available")
+            else ("disabled" if not use_macro else "data_unavailable")
+        ),
+        "statistical_drift_forecast_168h": (
+            "executed" if (use_stat_fc and stat_ok)
+            else ("disabled" if not use_stat_fc else "data_unavailable")
+        ),
+        "neural_chronos_model": (
+            "executed" if (use_neural_fc and neural_ok)
+            else ("not_executed_weights_absent" if use_neural_fc else "not_executed")
+        ),
+        "official_llm_review": "NOT_WIRED",
+        "contemporaneous_live_pillars": "executed" if enable_live_external else "not_executed_historical_replay",
+    }
+
     det_id = "dec_" + canonical_sha256({
         "symbol": bundle["symbol"],
         "decision_utc": bundle["decision_utc"],
         "bundle_hash": bundle["bundle_hash"],
         "equity_usdt": round(equity_usdt, 6),
         "planned_entry": round(planned_entry_price, 6) if planned_entry_price is not None else None,
-        "ablation": (enable_macro, enable_forecast, enable_critic_veto, enable_live_external),
+        "ablation": (use_cost_gate, use_macro, use_stat_fc, use_neural_fc, enable_live_external),
     })[:24]
 
     trace = {
@@ -375,11 +421,13 @@ def run_symbol_decision_trace(
         "symbol": bundle["symbol"],
         "decision_utc": bundle["decision_utc"],
         "ablation_flags": {
-            "enable_macro": enable_macro,
-            "enable_forecast": enable_forecast,
-            "enable_critic_veto": enable_critic_veto,
+            "enable_cost_gate": use_cost_gate,
+            "enable_macro_filter": use_macro,
+            "enable_stat_forecast_filter": use_stat_fc,
+            "enable_neural_forecast_filter": use_neural_fc,
             "enable_live_external": enable_live_external,
         },
+        "module_execution": module_execution,
         "final_action": risk_out["final_action"],
         "stand_aside_reason": risk_out["stand_aside_reason"],
         "evidence_bundle_hash": bundle["bundle_hash"],
