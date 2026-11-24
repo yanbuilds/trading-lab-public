@@ -1,0 +1,802 @@
+"""Comprehensive tests for PIIA Judgment v3: evidence integrity, tide, synthesis, chat Q&A, ablation, and non-interference."""
+from __future__ import annotations
+
+from copy import deepcopy
+from datetime import datetime, timedelta, timezone
+import json
+import sqlite3
+
+from fastapi.testclient import TestClient
+import pandas as pd
+import pytest
+
+from piia.intelligence.agent_v2.manifest import verify_piia_v2_frozen
+from piia.intelligence.judgment import evaluation as j_eval
+from piia.intelligence.judgment.chat_workbench import answer_judgment_query
+from piia.intelligence.judgment.evaluation import (
+    JudgmentLedgerKindError,
+    get_judgment_ledger_status,
+    load_latest_two_packets,
+    record_judgment_cycle,
+    run_domain_ablation,
+    run_four_way_comparison,
+)
+from piia.intelligence.judgment.evidence import generate_demo_judgment_inputs
+from piia.intelligence.judgment.manifest import verify_judgment_v3_frozen
+from piia.intelligence.judgment.synthesizer import synthesize_judgment_packet
+
+
+def test_frozen_v1_and_v2_2_1_controls_remain_untouched_and_judgment_v3_passes():
+    try:
+        from experiments.frozen_policy_capture import verify_policy
+    except ModuleNotFoundError as exc:
+        if exc.name != "talib":
+            raise
+    else:
+        verify_policy()  # Frozen policy v1 untouched (verified when TA-Lib is installed)
+    v2 = verify_piia_v2_frozen()
+    assert v2["ok"] is True
+    assert v2["manifest_sha256"] == "0c8358c94e3cf12beb0a719fef4c7227516bc77bce2a7528c0e3343cbdc47578"
+    v3 = verify_judgment_v3_frozen()
+    assert v3["ok"] is True
+
+
+def test_future_stale_duplicate_and_unverified_news_filtering():
+    bundle = generate_demo_judgment_inputs()
+    cutoff = pd.Timestamp(bundle["cutoff_utc"]).to_pydatetime()
+
+    bundle["raw_news_items"] = [
+        # 1. Verified primary release 2h before cutoff
+        {
+            "news_id": "n_primary",
+            "title": "Federal Reserve Press Release: FOMC signals dovish rate cut path as inflation cools",
+            "url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20261124a.htm",
+            "published_at_utc": (cutoff - timedelta(hours=2)).isoformat(),
+            "source_name": "Federal Reserve",
+            "source_kind": "primary_official",
+        },
+        # 2. Duplicate repost 30m later (same headline wording -> zero weight)
+        {
+            "news_id": "n_dup",
+            "title": "Federal Reserve Press Release: FOMC signals dovish rate cut path as inflation cools!",
+            "url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20261124a-copy.htm",
+            "published_at_utc": (cutoff - timedelta(hours=1, minutes=30)).isoformat(),
+            "source_name": "Mirror Feed",
+            "source_kind": "primary_official",
+        },
+        # 3. Future news (published AFTER cutoff -> strictly future_excluded)
+        {
+            "news_id": "n_future",
+            "title": "BLS CPI Inflation shocks higher after decision cutoff",
+            "url": "https://www.bls.gov/cpi/future_release.htm",
+            "published_at_utc": (cutoff + timedelta(minutes=10)).isoformat(),
+            "source_name": "BLS",
+            "source_kind": "primary_official",
+        },
+        # 4. Stale news (90h old > 72h -> strictly stale_excluded)
+        {
+            "news_id": "n_stale",
+            "title": "FOMC minutes old release",
+            "url": "https://www.federalreserve.gov/old.htm",
+            "published_at_utc": (cutoff - timedelta(hours=90)).isoformat(),
+            "source_name": "Federal Reserve",
+            "source_kind": "primary_official",
+        },
+        # 5. Unverified rumor (no URL / no timestamp -> unverified_unknown)
+        {
+            "news_id": "n_unverified",
+            "title": "Unverified rumor about bitcoin etf inflow",
+            "url": None,
+            "published_at_utc": None,
+            "verified": False,
+        },
+        # 6. Swing-only news (36h old -> eligible for swing_1_3d, excluded from intraday)
+        {
+            "news_id": "n_swing_only",
+            "title": "SEC approves spot bitcoin etf custody expansion filing",
+            "url": "https://www.sec.gov/Archives/edgar/data/0001/btc.htm",
+            "published_at_utc": (cutoff - timedelta(hours=36)).isoformat(),
+            "source_name": "SEC",
+            "source_kind": "primary_official",
+        },
+    ]
+
+    pkt = synthesize_judgment_packet(bundle, include_v2_control=False)
+    by_id = {n["news_id"]: n for n in pkt["news_audit"]}
+    assert by_id["n_primary"]["news_kind"] == "primary_release"
+    assert by_id["n_primary"]["freshness_status"] == "fresh"
+    assert by_id["n_dup"]["news_kind"] == "duplicate_repost"
+    assert by_id["n_dup"]["duplicate_of"] == "n_primary"
+    assert by_id["n_future"]["freshness_status"] == "future_excluded"
+    assert by_id["n_stale"]["freshness_status"] == "stale_excluded"
+    assert by_id["n_unverified"]["verification_status"] == "unverified_unknown"
+    assert by_id["n_unverified"]["freshness_status"] == "missing"
+    assert by_id["n_swing_only"]["freshness_status"] == "lagged_usable"
+    assert by_id["n_swing_only"]["eligible_horizons"] == ["swing_1_3d"]
+
+    atom_map = {a["evidence_id"]: a for a in pkt["evidence_atoms"]}
+    assert atom_map["news:n_future"]["role_by_symbol_horizon"].get("BTCUSDT:intraday") == "excluded_stale_or_future"
+    assert atom_map["news:n_stale"]["role_by_symbol_horizon"].get("BTCUSDT:swing_1_3d") == "excluded_stale_or_future"
+    assert atom_map["news:n_swing_only"]["role_by_symbol_horizon"].get("BTCUSDT:intraday") == "other_horizon_only"
+
+
+def test_cross_timestamp_mixing_and_etf_dashes_and_unrun_chronos():
+    # 1. Mismatched contract timestamps force coherence=False and all judgments stand aside
+    bad_bundle = generate_demo_judgment_inputs()
+    bad_bundle["market_snapshot"]["instruments"]["XAUUSDT"]["candles_closed_1h"].pop()  # 1h lagging!
+    pkt_bad = synthesize_judgment_packet(bad_bundle, include_v2_control=False)
+    assert pkt_bad["coherence"]["aligned"] is False
+    for sym in ("XAUUSDT", "BTCUSDT", "NDX100USDT"):
+        assert pkt_bad["judgments"][sym]["intraday"]["final_bias"] == "neutral_stand_aside"
+        assert pkt_bad["judgments"][sym]["swing_1_3d"]["final_bias"] == "neutral_stand_aside"
+
+    # 2. BTC ETF dashes ('-') / incomplete latest day MUST remain unknown/not zero + DXY/DTWEXBGS separation
+    bundle = generate_demo_judgment_inputs()
+    bundle["etf_flows"] = {
+        "usable_for_btc_research": False,
+        "latest_row_is_partial": True,
+        "latest_row": {"flow_date": "2026-11-23", "unreported_fund_count": 3, "complete": False},
+        "complete_daily_flows": [],
+    }
+    # Expired Chronos from an earlier cutoff (cutoff - 1h) MUST NOT be borrowed!
+    earlier = (pd.Timestamp(bundle["cutoff_utc"]) - pd.Timedelta(hours=1)).isoformat()
+    bundle["chronos_forecast"] = {
+        "weights_ran": True,
+        "model_id": "amazon/chronos-t5-tiny",
+        "revision": "29d808298f1a62493e7b9a5e08529d0d930fa189",
+        "run_at_utc": earlier,
+        "forecasts": {
+            "BTCUSDT": {
+                "ok": True,
+                "last_close_at_utc": earlier,
+                "quantile_10": [90000.0] * 24,
+                "quantile_50": [99000.0] * 24,
+                "quantile_90": [105000.0] * 24,
+            }
+        },
+    }
+    pkt = synthesize_judgment_packet(bundle, include_v2_control=False)
+    atoms = {a["evidence_id"]: a for a in pkt["evidence_atoms"]}
+
+    # Verify strict data-tier distinctions
+    assert atoms["macro:ice_dxy"]["data_tier"] == "unavailable"
+    assert atoms["macro:ice_dxy"]["freshness_status"] == "missing"
+    assert atoms["macro:broad_dollar_proxy:DTWEXBGS"]["data_tier"] == "proxy_series"
+    assert atoms["macro:broad_dollar_proxy:DTWEXBGS"]["value_summary"]["is_ice_dxy"] is False
+    assert atoms["macro:real_yield_daily:DFII10"]["data_tier"] == "latest_daily_vintage"
+    assert atoms["macro:real_yield_daily:DFII10"]["value_summary"]["intraday_realtime"] is False
+    assert atoms["sentiment:xau:cftc_cot_lagged"]["data_tier"] == "lagged_official_report"
+    assert atoms["sentiment:btc:onchain_network_activity"]["value_summary"]["measure"] == "network_activity_and_fee_congestion_not_exchange_flow"
+    assert atoms["sentiment:btc:onchain_exchange_netflow"]["freshness_status"] == "missing"
+
+    # ETF incomplete/dashes must stay missing (NOT coerced to 0.0!)
+    etf_atom = atoms["sentiment:btc:spot_etf_flows"]
+    assert etf_atom["freshness_status"] == "missing"
+    assert etf_atom["direction_by_symbol"]["BTCUSDT"] == "unknown"
+    assert etf_atom["value_summary"]["dashes_treated_as_zero"] is False
+    assert etf_atom["value_summary"]["sum_3_complete_days_musd"] is None
+
+    # Expired Chronos rejected cleanly; AI flags never forged
+    fc_btc = pkt["forecast_and_models"]["by_symbol"]["BTCUSDT"]["chronos_neural"]
+    assert fc_btc["weights_ran"] is False
+    assert fc_btc["status"] == "expired_excluded"
+    assert pkt["forecast_and_models"]["ai_provenance"]["llm_research_opinion"]["executed"] is False
+    assert pkt["forecast_and_models"]["ai_provenance"]["independent_ai_critic"]["status"] == "NOT_WIRED"
+
+    # Gold vs NDX divergence explanation present
+    assert "黄金" in pkt["macro_summary"]["gold_vs_ndx_divergence_note"]
+    assert "纳指" in pkt["macro_summary"]["gold_vs_ndx_divergence_note"]
+
+
+def test_tide_missing_data_stays_unknown_and_vix_alone_never_decides_ndx_direction():
+    # Remove all macro ALFRED series -> Tide macro_backdrop MUST become "unknown" & cycle_stage "insufficient_evidence"
+    bundle = generate_demo_judgment_inputs()
+    bundle["alfred_series"] = {}
+    bundle["etf_flows"] = {}
+    pkt_miss = synthesize_judgment_packet(bundle, include_v2_control=False)
+    assert pkt_miss["tide"]["macro_backdrop"]["state"] == "unknown"
+    assert pkt_miss["tide"]["cycle_stage"]["stage"] == "insufficient_evidence"
+
+    # High VIX spike alone when NDX technicals are neutral/unknown and macro is neutral -> VIX must NOT force bearish/bullish alone!
+    bundle_vix = generate_demo_judgment_inputs()
+    dates = [row["observation_date"] for row in bundle_vix["alfred_series"]["VIXCLS"]["observations"]]
+    for sid, flat_val in (("DFII10", 2.0), ("DTWEXBGS", 124.0), ("DGS10", 4.3), ("DGS2", 4.25), ("DFF", 4.5), ("WALCL", 6980000.0), ("WDTGAL", 800000.0), ("RRPONTSYD", 190.0), ("NASDAQ100", 20500.0), ("SP500", 5900.0)):
+        bundle_vix["alfred_series"][sid]["observations"] = [{"observation_date": d, "value": flat_val} for d in dates]
+    bundle_vix["alfred_series"]["VIXCLS"]["observations"] = [
+        {"observation_date": d, "value": 32.0 if i == len(dates) - 1 else 18.0}
+        for i, d in enumerate(dates)
+    ]
+    bundle_vix["raw_news_items"] = []
+    # Flatten NDX 1h candles into sideways range so technical_only is neutral_stand_aside
+    ndx_candles = bundle_vix["market_snapshot"]["instruments"]["NDX100USDT"]["candles_closed_1h"]
+    for c in ndx_candles:
+        c["open"] = c["close"] = 20500.0
+        c["high"] = 20520.0
+        c["low"] = 20480.0
+    pkt_vix = synthesize_judgment_packet(bundle_vix, include_v2_control=False)
+    assert pkt_vix["sentiment_summary"]["vix"]["elevated_volatility_regime"] is True
+    assert pkt_vix["judgments"]["NDX100USDT"]["intraday"]["final_bias"] == "neutral_stand_aside"
+    assert pkt_vix["judgments"]["NDX100USDT"]["swing_1_3d"]["final_bias"] == "neutral_stand_aside"
+
+    # Deterministic bit-for-bit reproducibility check
+    pkt_vix_2 = synthesize_judgment_packet(deepcopy(bundle_vix), include_v2_control=False)
+    assert pkt_vix["judgment_hash"] == pkt_vix_2["judgment_hash"]
+
+
+def test_imminent_macro_event_triggers_hard_veto_and_driver_deduplication():
+    bundle = generate_demo_judgment_inputs()
+    cutoff = pd.Timestamp(bundle["cutoff_utc"]).to_pydatetime()
+    bundle["event_calendar"] = {
+        "present_sources": ["bls"],
+        "retrieved_at_utc": cutoff.isoformat(),
+        "sources": {
+            "bls": {
+                "source_url": "https://www.bls.gov/schedule/news_release/",
+                "window_events": [
+                    {
+                        "agency": "bls",
+                        "title": "Consumer Price Index (CPI)",
+                        "scheduled_at_utc": (cutoff + timedelta(minutes=45)).isoformat(),
+                        "source_url": "https://www.bls.gov/schedule/news_release/",
+                    }
+                ],
+            }
+        },
+    }
+    pkt = synthesize_judgment_packet(bundle, include_v2_control=False)
+    # BTC intraday had bullish technical trend, MUST be vetoed to stand_aside by imminent CPI (<2h)
+    btc_intra = pkt["judgments"]["BTCUSDT"]["intraday"]
+    assert btc_intra["technical_only"]["bias"] == "bullish_bias"
+    assert btc_intra["final_bias"] == "neutral_stand_aside"
+    assert any("imminent_tier1_macro_event" in g for g in btc_intra["hard_gates_triggered"])
+    assert any(ev["consensus"]["status"] == "unavailable_in_official_public_feed" for ev in pkt["macro_summary"]["events"])
+
+
+def test_chat_workbench_qa_whatif_diff_and_isolated_shadow_ledger(tmp_path, monkeypatch):
+    real_db = tmp_path / "j3_live.sqlite"
+    demo_db = tmp_path / "j3_demo.sqlite"
+    monkeypatch.setattr(j_eval, "REAL_JUDGMENT_LEDGER_PATH", real_db)
+    monkeypatch.setattr(j_eval, "DEMO_JUDGMENT_LEDGER_PATH", demo_db)
+
+    b1 = generate_demo_judgment_inputs(step_shift_hours=0)
+    # First run with test_or_injected isolated ledger via demo=True (synthetic demo)
+    rec1 = record_judgment_cycle(b1, db_path=demo_db)
+    assert rec1["status"] == "recorded_judgment_cycle"
+
+    # Cross-kind write refused into live shadow ledger!
+    with pytest.raises(JudgmentLedgerKindError):
+        record_judgment_cycle(b1, db_path=real_db)
+
+    # SQLite triggers forbid mutating past judgment packets or arm_judgments
+    with sqlite3.connect(demo_db) as conn:
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("UPDATE arm_judgments SET predicted_bias = 'bullish_bias'")
+        with pytest.raises(sqlite3.IntegrityError, match="append-only"):
+            conn.execute("DELETE FROM judgment_packets")
+
+    # Second cycle 2 hours later: also resolves nothing mature yet (6h > 2h) & populates previous_packet
+    b2 = generate_demo_judgment_inputs(step_shift_hours=2)
+    rec2 = record_judgment_cycle(b2, db_path=demo_db)
+    assert rec2["status"] == "recorded_judgment_cycle"
+    cur_pkt, prev_pkt = load_latest_two_packets(demo_db)
+    assert cur_pkt is not None and prev_pkt is not None
+
+    # Q1: Main 3-contract overview
+    q1 = answer_judgment_query("今天黄金、BTC、纳指 100 看多还是看空？", packet=cur_pkt, previous_packet=prev_pkt)
+    assert q1["intent"] == "overview"
+    assert len(q1["summary_table"]) == 3
+    assert "v2.2.1 正式信号" in q1["markdown"]
+
+    # Q2: Why not short?
+    q2 = answer_judgment_query("BTC为什么不做空？", packet=cur_pkt, previous_packet=prev_pkt)
+    assert q2["intent"] == "why_not_direction"
+    assert "BTCUSDT" in q2["details_by_symbol"]
+
+    # Q3: Counterfactual sensitivity: what if dollar & real yields rise vs drop?
+    q3_up = answer_judgment_query("如果美元上升且实际利率走高会改判吗？", packet=cur_pkt, previous_packet=prev_pkt)
+    assert q3_up["intent"] == "what_if_sensitivity"
+    assert q3_up["counterfactual_simulation"] is True
+    assert len(q3_up["scenario"]) == 2
+    assert any(d["direction_changed"] or d["conviction_changed"] for d in q3_up["diffs"])
+
+    q3_down = answer_judgment_query("如果美元走弱且降息预期升温会改判吗？", packet=cur_pkt, previous_packet=prev_pkt)
+    assert q3_down["intent"] == "what_if_sensitivity"
+    assert q3_down["counterfactual_simulation"] is True
+    assert len(q3_down["diffs"]) == 6
+
+    # Q4: Diff since last snapshot
+    q4 = answer_judgment_query("相比上次，哪条证据变了？", packet=cur_pkt, previous_packet=prev_pkt)
+    assert q4["intent"] == "diff_since_last"
+    assert len(q4["evidence_changes"]) >= 1
+
+    st = get_judgment_ledger_status(demo_db, demo=True)
+    assert st["packets_recorded"] == 2
+    assert st["validation_status"] == "NOT_A_PROSPECTIVE_LEDGER"
+    assert not real_db.exists()
+
+
+def test_four_way_ai_comparison_five_domain_ablation_cli_and_api(tmp_path, monkeypatch):
+    from piia.intelligence.api import app
+    from piia.intelligence.cli import main as piia_main
+
+    # 1. Four-way AI vs Rules comparison: unconfigured first, then with deterministic mock AI verifying A1 vs A2 isolation
+    bundle = generate_demo_judgment_inputs()
+    comp_unconf = run_four_way_comparison(bundle)
+    assert comp_unconf["arms"]["A1_direct_ai_candles_only"]["status"] == "NOT_RUN_NEEDS_MODEL_CONFIG"
+    assert comp_unconf["arms"]["A2_ai_freeform_same_packet"]["status"] == "NOT_RUN_NEEDS_MODEL_CONFIG"
+    assert comp_unconf["arms"]["A1_direct_ai_candles_only"]["payload_keys"] == ["cutoff_utc", "instruments", "task"]
+    assert "evidence_atoms" in comp_unconf["arms"]["A2_ai_freeform_same_packet"]["payload_keys"]
+
+    class _MockAI:
+        def compare(self, arm_name: str, payload: dict) -> dict:
+            if arm_name == "A1_direct_ai_candles_only":
+                assert "evidence_atoms" not in payload
+                return {"status": "completed", "decisions": {"BTCUSDT": {"intraday": "bullish_bias", "swing_1_3d": "bullish_bias"}}}
+            assert "evidence_atoms" in payload
+            return {"status": "completed", "decisions": {"BTCUSDT": {"intraday": "neutral_stand_aside", "swing_1_3d": "bearish_bias"}}}
+
+    comp_ai = run_four_way_comparison(bundle, ai_provider=_MockAI())
+    assert comp_ai["arms"]["A1_direct_ai_candles_only"]["status"] == "completed"
+    assert comp_ai["arms"]["A2_ai_freeform_same_packet"]["status"] == "completed"
+
+    # 2. Five-domain leave-one-out ablation across a 3-hour sequence (tests shadow paper metrics too)
+    seq = [generate_demo_judgment_inputs(step_shift_hours=h) for h in range(3)]
+    abl = run_domain_ablation(seq[0], replay_sequence=seq)
+    for arm in ("Full", "No_Macro", "No_Tide", "No_Sentiment_Flow", "No_News", "No_Forecast", "Technical_Only"):
+        assert arm in abl["arms"]
+        assert "shadow_paper_1x_slip" in abl["arms"][arm]
+        assert abl["arms"][arm]["shadow_paper_1x_slip"]["net_return_pct_with_funding"] is None  # unknown funding stays None
+
+    # 3. CLI & FastAPI end-to-end on demo ledger in tmp_path
+    cli_demo_db = tmp_path / "cli_j3_demo.sqlite"
+    assert piia_main(["judgment-verify-freeze"]) == 0
+    assert piia_main(["judgment-run", "--demo", "--db", str(cli_demo_db)]) == 0
+    assert piia_main(["judgment-ask", "今天黄金、BTC、纳指 100 看多还是看空？", "--demo", "--db", str(cli_demo_db)]) == 0
+    assert piia_main(["judgment-status", "--demo", "--db", str(cli_demo_db)]) == 0
+
+    api_demo_db = tmp_path / "api_j3_demo.sqlite"
+    monkeypatch.setenv("PIIA_JUDGMENT_V3_DEMO_LEDGER_PATH", str(api_demo_db))
+    with TestClient(app) as client:
+        assert client.get("/judgment-v3/verify-freeze").json()["ok"] is True
+        r_run = client.post("/judgment-v3/run", json={"demo_mode": True, "starting_cash": 500.0})
+        assert r_run.status_code == 200
+        r_ask = client.post("/judgment-v3/ask", json={"question": "如果美元上升会改判吗？", "demo_mode": True})
+        assert r_ask.status_code == 200
+        assert r_ask.json()["counterfactual_simulation"] is True
+        r_abl = client.get("/judgment-v3/ablation?demo=true&starting_cash=100")
+        assert r_abl.status_code == 200
+        assert r_abl.json()["starting_cash_usdt"] == 100.0
+        assert "Full" in r_abl.json()["domain_ablation"]["arms"]
+        r_nv = client.get("/judgment-v3/replay-nvidia?starting_cash=100")
+        assert r_nv.status_code == 200
+        assert r_nv.json()["scenarios"]["2_news_missed_anomaly_breakout_only"]["v3_paper_status"] == "pending_review"
+
+
+def test_temporal_sanitization_a0_a1_a2_a3_macro_polymarket_and_post_availability_ledger(tmp_path, monkeypatch):
+    from piia.intelligence.judgment.news import parse_aware_timestamp
+
+    bundle = generate_demo_judgment_inputs(step_shift_hours=0)
+    cutoff_dt = parse_aware_timestamp(bundle["cutoff_utc"])
+    assert cutoff_dt is not None
+
+    # Inject dirty candles into NDX100USDT: out-of-order, duplicate, missing-ts, unclosed, future
+    clean_rows = list(bundle["market_snapshot"]["instruments"]["NDX100USDT"]["candles_closed_1h"])
+    last_bar = deepcopy(clean_rows[-1])
+    dup_bar = deepcopy(clean_rows[-1])
+    swap_a, swap_b = deepcopy(clean_rows[-3]), deepcopy(clean_rows[-2])
+    missing_ts_bar = {"open": 25000.0, "high": 25010.0, "low": 24990.0, "close": 25005.0, "volume": 1.0}
+    unclosed_bar = deepcopy(last_bar)
+    unclosed_bar["open_at_utc"] = cutoff_dt.isoformat()
+    unclosed_bar["close_at_utc"] = (cutoff_dt + timedelta(hours=1)).isoformat()
+    unclosed_bar["is_closed"] = False
+    future_bar = deepcopy(last_bar)
+    future_bar["open_at_utc"] = (cutoff_dt + timedelta(hours=1)).isoformat()
+    future_bar["close_at_utc"] = (cutoff_dt + timedelta(hours=2)).isoformat()
+    dirty_rows = clean_rows[:-3] + [swap_b, swap_a, dup_bar, missing_ts_bar, last_bar, unclosed_bar, future_bar]
+    bundle["market_snapshot"]["instruments"]["NDX100USDT"]["candles_closed_1h"] = dirty_rows
+
+    # Inject future vintage ALFRED macro & stale/future Polymarket events
+    bundle["alfred_series"]["DTWEXBGS"]["vintage_date"] = (cutoff_dt + timedelta(days=2)).date().isoformat()
+    bundle["polymarket"] = {
+        "usable_for_research": True,
+        "asof_utc": cutoff_dt.isoformat(),
+        "retrieved_at_utc": cutoff_dt.isoformat(),
+        "events": [
+            {
+                "id": "pm_future",
+                "title": "Future close test market",
+                "asset_mapping": {"relevant_instruments": ["BTCUSDT"]},
+                "markets": [
+                    {
+                        "closed": False,
+                        "question": "Future book timestamp test",
+                        "outcomes": [
+                            {
+                                "name": "Yes",
+                                "book": {
+                                    "asof_utc": (cutoff_dt + timedelta(minutes=10)).isoformat(),
+                                    "usable_for_implied_probability": True,
+                                    "official_midpoint": 0.72,
+                                    "official_spread": 0.02,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+            {
+                "id": "pm_stale",
+                "title": "Stale market event",
+                "asset_mapping": {"relevant_instruments": ["BTCUSDT"]},
+                "markets": [
+                    {
+                        "closed": False,
+                        "question": "Stale book timestamp test",
+                        "outcomes": [
+                            {
+                                "name": "Yes",
+                                "book": {
+                                    "asof_utc": (cutoff_dt - timedelta(minutes=45)).isoformat(),
+                                    "usable_for_implied_probability": True,
+                                    "official_midpoint": 0.55,
+                                    "official_spread": 0.02,
+                                },
+                            }
+                        ],
+                    }
+                ],
+            },
+        ],
+    }
+
+    captured: dict[str, dict] = {}
+
+    class _VerifySanitizedAI:
+        def compare(self, arm_name: str, payload: dict) -> dict:
+            captured[arm_name] = payload
+            return {"status": "completed", "decisions": {"BTCUSDT": {"intraday": "bullish_bias", "swing_1_3d": "bullish_bias"}}}
+
+    comp = run_four_way_comparison(bundle, ai_provider=_VerifySanitizedAI(), starting_cash_usdt=100.0)
+    a1_bars = captured["A1_direct_ai_candles_only"]["instruments"]["NDX100USDT"]["recent_closed_1h_tail"]
+    assert len(a1_bars) == 48
+    opens = [parse_aware_timestamp(b["open_at_utc"]) for b in a1_bars]
+    closes = [parse_aware_timestamp(b["close_at_utc"]) for b in a1_bars]
+    assert all(o is not None and c is not None and c <= cutoff_dt for o, c in zip(opens, closes))
+    assert opens == sorted(opens) and len(set(opens)) == 48
+    audit_ndx = comp["input_audit"]["arms"]["A1_direct_ai_candles_only"]["sanitization_audit"]["NDX100USDT"]
+    assert audit_ndx["dropped_invalid"] >= 1
+    assert audit_ndx["dropped_unclosed"] >= 1
+    assert audit_ndx["dropped_future"] >= 1
+    assert audit_ndx["dropped_duplicate"] >= 1
+    assert audit_ndx["was_out_of_order"] is True
+    assert comp["input_audit"]["arms"]["A1_direct_ai_candles_only"]["model_config"] == comp["input_audit"]["arms"]["A2_ai_freeform_same_packet"]["model_config"]
+
+    pkt = synthesize_judgment_packet(bundle, include_v2_control=False)
+    atoms = {a["evidence_id"]: a for a in pkt["evidence_atoms"]}
+    assert atoms["macro:broad_dollar_proxy:DTWEXBGS"]["freshness_status"] == "future_excluded"
+    assert atoms["sentiment:polymarket:filtered_events"]["freshness_status"] == "stale_excluded"
+    lc = pkt["lifecycle_timestamps"]
+    for req_ts in ("bar_cutoff_utc", "latest_announcement_published_at_utc", "first_retrieved_at_utc", "judgment_generated_at_utc", "earliest_executable_at_utc"):
+        assert req_ts in lc
+    assert parse_aware_timestamp(lc["earliest_executable_at_utc"]) >= parse_aware_timestamp(lc["judgment_generated_at_utc"])
+
+    # Test non-contiguous snapshots: h=0, h=1, and h=3 (gap at h=2) -> 3 snapshots, max_contiguous=2, missing=1
+    demo_db = tmp_path / "non_contig.sqlite"
+    for h_shift in (0, 1, 3):
+        rec = record_judgment_cycle(generate_demo_judgment_inputs(step_shift_hours=h_shift), db_path=demo_db)
+        assert rec["status"] == "recorded_judgment_cycle"
+    st = get_judgment_ledger_status(demo_db, demo=True)
+    assert st["packets_recorded"] == 3
+    assert st["max_contiguous_hours"] == 2
+    assert st["missing_hours_in_span"] == 1
+    assert st["arm_outcomes"] == {}  # post-availability 6h hasn't matured yet!
+
+    # Advance to +7h -> cycle h=0 had earliest_exec at h=1, so +6h from earliest_exec = h=7 (now matures!)
+    # Whereas at h=6 (cutoff + 6h BEFORE earliest_exec + 6h), outcome must remain unresolved!
+    rec_h6 = record_judgment_cycle(generate_demo_judgment_inputs(step_shift_hours=6), db_path=demo_db)
+    assert rec_h6["outcomes_resolved"] == 0
+    rec_h7 = record_judgment_cycle(generate_demo_judgment_inputs(step_shift_hours=7), db_path=demo_db)
+    assert rec_h7["outcomes_resolved"] > 0
+
+
+def test_nvidia_case_4_scenarios_verified_volume_and_corporate_ir_edgar(monkeypatch):
+    import sys
+    from piia.intelligence.judgment.manifest import ROOT
+    from piia.intelligence.judgment.news import classify_and_filter_news_items, fetch_ndx_sec_edgar_filings, parse_rss_or_atom
+
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from experiments.replay_nvidia_20261123_case import _build_base_bundle, replay_nvidia_20261123_case
+
+    rep = replay_nvidia_20261123_case(starting_cash_usdt=100.0)
+    sc = rep["scenarios"]
+    assert sc["1a_timely_official_announcement_1402z"]["official_v2_2_1_signal"] == "short"
+    assert sc["1a_timely_official_announcement_1402z"]["v3_paper_status"] == "pending_review"
+    assert sc["1a_timely_official_announcement_1402z"]["volume_ma20_verified_surge"] is True
+    assert "放量" in sc["1a_timely_official_announcement_1402z"]["tide_structure_cn"]
+
+    assert sc["1b_delayed_live_retrieval_1449z"]["lifecycle_timestamps"]["earliest_executable_at_utc"] == "2026-11-23T15:00:00+00:00"
+    assert sc["1b_delayed_live_retrieval_1449z"]["v3_paper_status"] == "pending_review"
+
+    assert sc["2_news_missed_anomaly_breakout_only"]["official_v2_2_1_signal"] == "short"
+    assert sc["2_news_missed_anomaly_breakout_only"]["v3_intraday_final_bias"] == "neutral_stand_aside"
+    assert sc["2_news_missed_anomaly_breakout_only"]["v3_paper_status"] == "pending_review"
+    assert "shock_breakout_vs_counter_trend_short" in sc["2_news_missed_anomaly_breakout_only"]["v3_review_triggers"]
+
+    assert sc["3_symmetric_downside_breakdown_vs_long"]["official_v2_2_1_signal"] == "long"
+    assert sc["3_symmetric_downside_breakdown_vs_long"]["v3_paper_status"] == "pending_review"
+    assert "shock_breakdown_vs_counter_trend_long" in sc["3_symmetric_downside_breakdown_vs_long"]["v3_review_triggers"]
+
+    assert sc["4_ordinary_range_market_not_intercepted"]["official_v2_2_1_signal"] == "short"
+    assert sc["4_ordinary_range_market_not_intercepted"]["v3_paper_eligible"] is True
+    assert sc["4_ordinary_range_market_not_intercepted"]["v3_paper_status"] == "eligible"
+
+    # Verified volume wording test: same breakout geometry with normal volume must NOT emit "放量"
+    b_low_vol = _build_base_bundle(cutoff_iso="2026-11-23T14:00:00+00:00", retrieved_iso="2026-11-23T14:02:00+00:00", upside_shock=True)
+    b_low_vol["market_snapshot"]["instruments"]["NDX100USDT"]["candles_closed_1h"][-1]["volume"] = 2.0
+    pkt_lv = synthesize_judgment_packet(b_low_vol, include_v2_control=False)
+    pos_lv = pkt_lv["tide"]["instrument_positions"]["NDX100USDT"]
+    assert pos_lv["metrics"]["volume_surge_verified"] is False
+    assert "放量" not in pos_lv["structure_kind_cn"]
+
+    # Corporate IR RSS (NVIDIA Newsroom) + SEC EDGAR items list parsing offline
+    rss_xml = b"""<?xml version="1.0" encoding="UTF-8"?>
+    <rss version="2.0"><channel><title>NVIDIA Newsroom</title>
+    <item>
+      <title>NVIDIA Board Reinstates Jensen Huang as President, CEO and Board Director</title>
+      <link>https://nvidianews.nvidia.com/news/nvidia-board-reinstates-jensen-huang-as-president-ceo-and-board-director</link>
+      <pubDate>Mon, 23 Nov 2026 13:55:00 GMT</pubDate>
+    </item></channel></rss>"""
+    parsed_rss = parse_rss_or_atom(
+        rss_xml,
+        feed_id="nvda_newsroom",
+        feed_name="NVIDIA Newsroom RSS",
+        retrieved_at=datetime(2026, 11, 23, 14, 2, tzinfo=timezone.utc),
+    )
+    assert len(parsed_rss) == 1
+    assert "13:55:00" in parsed_rss[0]["published_at_raw"]
+    cls_nvda = classify_and_filter_news_items(parsed_rss, cutoff_utc=datetime(2026, 11, 23, 14, 0, tzinfo=timezone.utc), replay_mode=True)
+    assert cls_nvda[0]["published_at_utc"] == "2026-11-23T13:55:00+00:00"
+    assert cls_nvda[0]["verification_status"] == "verified"
+    assert cls_nvda[0]["news_kind"] == "primary_release"
+
+    class _FakeResp:
+        def __init__(self, payload: dict):
+            self._payload = payload
+            self.content = json.dumps(payload).encode("utf-8")
+            self.status_code = 200
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    class _FakeClient:
+        def __init__(self, **_kw):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+        def get(self, url, **_kw):
+            return _FakeResp(
+                {
+                    "name": "NVIDIA CORP",
+                    "filings": {
+                        "recent": {
+                            "form": ["8-K", "10-Q"],
+                            "filingDate": ["2026-11-23", "2026-11-18"],
+                            "acceptanceDateTime": ["2026-11-23T13:57:54.000Z", "2026-11-18T21:00:00.000Z"],
+                            "accessionNumber": ["0001045810-26-000123", "0001045810-26-000100"],
+                            "primaryDocument": ["nvda8k.htm", "nvda10q.htm"],
+                            "items": [["5.02", "9.01"], []],
+                        }
+                    },
+                }
+            )
+
+    filings_out, edgar_errs = fetch_ndx_sec_edgar_filings(
+        cutoff_utc=datetime(2026, 11, 23, 14, 0, tzinfo=timezone.utc),
+        client=_FakeClient(),
+    )
+    assert edgar_errs == {}
+    assert len(filings_out) >= 1
+    assert filings_out[0]["items"] == "5.02,9.01"
+    assert "items=5.02,9.01" in filings_out[0]["title"]
+
+
+def test_grokbot_factor_usage_ledger_adapters_supplement_and_ai_chronos_paths(monkeypatch):
+    bundle = generate_demo_judgment_inputs()
+    cutoff = pd.Timestamp(bundle["cutoff_utc"]).to_pydatetime()
+
+    # Live TFTC schema: latest_complete_row without complete_daily_flows + real Polymarket schema
+    bundle["etf_flows"] = {
+        "usable_for_btc_research": True,
+        "asof_complete_flow_date": cutoff.date().isoformat(),
+        "date_modified": cutoff.isoformat(),
+        "latest_complete_row": {"flow_date": cutoff.date().isoformat(), "table_total_millions_usd": -669.16, "complete": True},
+        "source_url": "https://bitcoinetf.tftc.io/",
+    }
+    bundle["polymarket"] = {
+        "usable_for_research": True,
+        "asof_utc": cutoff.isoformat(),
+        "retrieved_at_utc": cutoff.isoformat(),
+        "events": [
+            {
+                "id": "pm_live_ok",
+                "title": "Bitcoin above 100k by Dec 31?",
+                "category": "crypto_price",
+                "asset_mapping": {"relevant_instruments": ["BTCUSDT", "NDX100USDT"], "mapping_kind": "direct"},
+                "markets": [
+                    {
+                        "closed": False,
+                        "question": "BTC > 100k?",
+                        "outcomes": [
+                            {
+                                "name": "Yes",
+                                "book": {
+                                    "asof_utc": (cutoff - timedelta(seconds=30)).isoformat(),
+                                    "usable_for_implied_probability": True,
+                                    "official_midpoint": 0.63,
+                                    "official_spread": 0.02,
+                                    "change_24h": {"change_24h_pp": 4.0, "to_timestamp_utc": cutoff.isoformat()},
+                                },
+                            }
+                        ],
+                    }
+                ],
+            }
+        ],
+    }
+    bundle["chronos_forecast"] = {
+        "weights_ran": True,
+        "model_id": "amazon/chronos-t5-tiny",
+        "revision": "29d808298f1a62493e7b9a5e08529d0d930fa189",
+        "run_at_utc": cutoff.isoformat(),
+        "forecasts": {
+            "BTCUSDT": {
+                "ok": True,
+                "last_close_at_utc": cutoff.isoformat(),
+                "quantile_10": [98000.0] * 24,
+                "quantile_50": [103500.0] * 24,
+                "quantile_90": [108000.0] * 24,
+            }
+        },
+    }
+    bundle["agent_or_human_supplement"] = "Agent noted desk liquidity thinner ahead of holiday."
+
+    pkt = synthesize_judgment_packet(bundle, starting_cash_usdt=100.0)
+    assert set(pkt["factor_usage_ledger"].keys()) == {
+        "macro",
+        "tide",
+        "sentiment_positioning",
+        "etf_and_onchain",
+        "polymarket",
+        "news",
+        "forecast_models",
+    }
+    etf_entries = {e["factor_id"]: e for e in pkt["factor_usage_ledger"]["etf_and_onchain"]}
+    assert etf_entries["sentiment:btc:spot_etf_flows"]["api_responded_ok"] is True
+    assert etf_entries["sentiment:btc:spot_etf_flows"]["participated_in_judgment"] is True
+    assert etf_entries["sentiment:xau:gold_etf_flows"]["participation_status"] == "missing"
+
+    pm_entry = pkt["factor_usage_ledger"]["polymarket"][0]
+    assert pm_entry["api_responded_ok"] is True
+    assert pm_entry["participated_in_judgment"] is True
+    assert pm_entry["participation_status"] == "background_only"
+
+    macro_entries = {e["factor_id"]: e for e in pkt["factor_usage_ledger"]["macro"]}
+    assert macro_entries["macro:real_yield_intraday"]["participation_status"] == "missing"
+    assert macro_entries["macro:real_yield_daily:DFII10"]["participated_in_judgment"] is True
+
+    fc_entries = {e["factor_id"]: e for e in pkt["factor_usage_ledger"]["forecast_models"]}
+    assert fc_entries["forecast:btcusdt:chronos_neural"]["participated_in_judgment"] is True
+    assert fc_entries["model:llm_research_opinion"]["participation_status"] == "not_run"
+
+    assert pkt["agent_or_human_supplement"]["provided"] is True
+    assert pkt["agent_or_human_supplement"]["can_override_risk_gate"] is False
+
+    # Offline mock HTTP tests for OpenAI & Anthropic official AI calls inside _call_official_ai_for_comparison
+    for prov, resp_json in (
+        ("openai", {"choices": [{"message": {"content": "```json\n{\"BTCUSDT\": {\"intraday\": \"bullish_bias\", \"swing_1_3d\": \"bullish_bias\"}}\n```"}}], "usage": {"total_tokens": 42}}),
+        ("anthropic", {"content": [{"type": "text", "text": "{\"BTCUSDT\": {\"intraday\": \"bearish_bias\", \"swing_1_3d\": \"neutral_stand_aside\"}}"}], "usage": {"input_tokens": 10, "output_tokens": 10}}),
+    ):
+        monkeypatch.setattr(j_eval, "model_configured", lambda: True)
+        monkeypatch.setattr(j_eval, "model_provider", lambda p=prov: p)
+        monkeypatch.setattr(j_eval, "model_base_url", lambda: "https://api.example.invalid")
+        monkeypatch.setattr(j_eval, "model_name", lambda: "test-model")
+        monkeypatch.setenv("PIIA_MODEL_API_KEY", "sk-offline-dummy")
+
+        class _MockAIResp:
+            def __init__(self, d):
+                self._d = d
+
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return self._d
+
+        class _MockAIClient:
+            def __init__(self, **_kw):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def post(self, *_args, **kwargs):
+                assert kwargs["json"]["temperature"] == 0
+                return _MockAIResp(resp_json)
+
+        monkeypatch.setattr(j_eval.httpx, "Client", _MockAIClient)
+        out = j_eval._call_official_ai_for_comparison("A1_direct_ai_candles_only", {"cutoff_utc": bundle["cutoff_utc"]})
+        assert out["status"] == "completed"
+        assert "BTCUSDT" in out["decisions"]
+
+
+def test_fair_100_usdt_shadow_simulation_min_qty_funding_portfolio_audit_and_cli_nvidia(tmp_path):
+    from piia.intelligence.cli import main as piia_main
+    from piia.intelligence.judgment.evaluation import _simulate_shadow_paper_sequence, evaluate_portfolio_risk_audit
+
+    seq_bundles = [generate_demo_judgment_inputs(step_shift_hours=h) for h in range(10)]
+    pairs = [(synthesize_judgment_packet(b, starting_cash_usdt=100.0), b["market_snapshot"]) for b in seq_bundles]
+
+    # 1. Verify funding missing -> None, funding schedule covering window -> verified return
+    sim_unknown = _simulate_shadow_paper_sequence(pairs, arm_selector="full", starting_cash=100.0, funding_by_symbol=None)
+    assert sim_unknown["starting_cash_usdt"] == 100.0
+    assert sim_unknown["net_return_pct_with_funding"] is None
+
+    # Build full 8h funding schedule covering all timestamps across seq_bundles
+    t0 = pd.Timestamp(seq_bundles[0]["cutoff_utc"]).to_pydatetime().replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    full_funding = {
+        sym: [
+            {"timestamp": int((t0 + timedelta(hours=8 * k)).timestamp() * 1000), "rate": 0.0001}
+            for k in range(20)
+        ]
+        for sym in ("XAUUSDT", "BTCUSDT", "NDX100USDT")
+    }
+    sim_verified = _simulate_shadow_paper_sequence(pairs, arm_selector="full", starting_cash=100.0, funding_by_symbol=full_funding)
+    assert sim_verified["funding_status"] in {"verified_from_historical_schedule", "verified_zero_exposure"}
+    assert sim_verified["net_return_pct_with_funding"] is not None
+
+    # 2. Verify pending_review_skips when first packet has NDX pending_review & high min_qty rejection when ATR huge
+    huge_atr_pairs = deepcopy(pairs)
+    for pkt, mkt in huge_atr_pairs:
+        for sym in ("XAUUSDT", "BTCUSDT", "NDX100USDT"):
+            pkt["judgments"][sym]["swing_1_3d"]["final_bias"] = "bullish_bias"
+            pkt["judgments"][sym]["paper_eligibility"]["status"] = "eligible"
+            for r in mkt["instruments"][sym]["candles_closed_1h"][-14:]:
+                r["high"] = float(r["close"]) * 1.15
+                r["low"] = float(r["close"]) * 0.85
+    sim_reject = _simulate_shadow_paper_sequence(huge_atr_pairs, arm_selector="full", starting_cash=100.0)
+    assert sim_reject["min_qty_budget_rejections"] >= 1
+
+    # 3. Portfolio risk audit strictly denies single-position sufficiency
+    pa = evaluate_portfolio_risk_audit(
+        {sym: seq_bundles[-1]["market_snapshot"]["instruments"][sym]["candles_closed_1h"] for sym in ("XAUUSDT", "BTCUSDT", "NDX100USDT")},
+        [{"symbol": "BTCUSDT", "side": "long", "notional_usdt": 150.0}, {"symbol": "NDX100USDT", "side": "long", "notional_usdt": 120.0}],
+        equity_usdt=100.0,
+    )
+    assert pa["single_position_sim_proves_portfolio_safety"] is False
+    assert pa["portfolio_risk_ok"] is False
+    assert any("gross_leverage_exceeds_cap" in w for w in pa["warnings"])
+
+    # 4. CLI judgment-replay-nvidia + supplement note
+    nv_out = tmp_path / "nv_case.json"
+    assert piia_main(["judgment-replay-nvidia", "--starting-cash", "100", "--out", str(nv_out)]) == 0
+    assert json.loads(nv_out.read_text(encoding="utf-8"))["scenarios"]["3_symmetric_downside_breakdown_vs_long"]["v3_paper_status"] == "pending_review"
+
+    cli_db = tmp_path / "cli_supp.sqlite"
+    assert piia_main(["judgment-ask", "今天黄金、BTC、纳指 100 看多还是看空？", "--demo", "--starting-cash", "100", "--supplement-note", "CLI test supplement", "--db", str(cli_db)]) == 0
+    cur_p, _ = load_latest_two_packets(cli_db)
+    assert cur_p is not None and cur_p["starting_cash_usdt"] == 100.0
+    assert cur_p["agent_or_human_supplement"]["note"] == "CLI test supplement"
+    assert cur_p["agent_or_human_supplement"]["can_override_risk_gate"] is False
+

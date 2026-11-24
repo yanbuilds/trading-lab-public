@@ -504,3 +504,108 @@ def agent_v2_decide_proposal(proposal_id: str, payload: AgentProposalDecisionIn)
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+class JudgmentAskIn(BaseModel):
+    question: str
+    demo_mode: bool = False
+    refresh: bool = False
+    starting_cash: float = 500.0
+    supplement_note: str | None = None
+
+
+class JudgmentRunIn(BaseModel):
+    demo_mode: bool = False
+    starting_cash: float = 500.0
+    supplement_note: str | None = None
+
+
+def _resolve_judgment_v3_ledger(demo: bool = False) -> Path:
+    import os
+    from piia.intelligence.judgment.evaluation import default_judgment_ledger_path
+    override = os.environ.get("PIIA_JUDGMENT_V3_DEMO_LEDGER_PATH" if demo else "PIIA_JUDGMENT_V3_LEDGER_PATH")
+    return Path(override) if override else default_judgment_ledger_path(demo=demo)
+
+
+@app.get("/judgment-v3/verify-freeze")
+def judgment_v3_verify_freeze():
+    from piia.intelligence.judgment.manifest import verify_judgment_v3_frozen
+    return verify_judgment_v3_frozen()
+
+
+@app.get("/judgment-v3/status")
+def judgment_v3_status(demo: bool = False):
+    from piia.intelligence.judgment.evaluation import get_judgment_ledger_status
+    return get_judgment_ledger_status(_resolve_judgment_v3_ledger(demo), demo=demo)
+
+
+@app.post("/judgment-v3/run")
+def judgment_v3_run(payload: JudgmentRunIn):
+    from piia.intelligence.judgment.evaluation import record_judgment_cycle
+    try:
+        return record_judgment_cycle(
+            db_path=_resolve_judgment_v3_ledger(payload.demo_mode),
+            demo_mode=payload.demo_mode,
+            starting_cash=payload.starting_cash,
+            supplement_note=payload.supplement_note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/judgment-v3/ask")
+def judgment_v3_ask(payload: JudgmentAskIn):
+    from datetime import datetime, timezone
+    from piia.intelligence.judgment.chat_workbench import answer_judgment_query
+    from piia.intelligence.judgment.evaluation import load_latest_two_packets, log_chat_qa, record_judgment_cycle
+    db_p = _resolve_judgment_v3_ledger(payload.demo_mode)
+    try:
+        cur_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+        cur_pkt, prev_pkt = load_latest_two_packets(db_p)
+        need_rec = (
+            payload.refresh
+            or bool(payload.supplement_note)
+            or cur_pkt is None
+            or (cur_pkt.get("cutoff_utc") != cur_hour and not payload.demo_mode)
+            or abs(float(cur_pkt.get("starting_cash_usdt") or 500.0) - float(payload.starting_cash)) > 1e-6
+        )
+        if need_rec:
+            rec = record_judgment_cycle(
+                db_path=db_p,
+                demo_mode=payload.demo_mode,
+                starting_cash=payload.starting_cash,
+                supplement_note=payload.supplement_note,
+            )
+            loaded_cur, loaded_prev = load_latest_two_packets(db_p)
+            cur_pkt = rec["packet"] if rec.get("status") == "already_recorded_for_hour" else (loaded_cur or rec["packet"])
+            prev_pkt = loaded_prev
+        qa = answer_judgment_query(payload.question, packet=cur_pkt, previous_packet=prev_pkt)
+        log_chat_qa(db_p, qa)
+        return qa
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.get("/judgment-v3/ablation")
+def judgment_v3_ablation(demo: bool = True, call_live_model: bool = False, starting_cash: float = 100.0, replay_eval: bool = False):
+    from piia.intelligence.judgment.evaluation import run_domain_ablation, run_four_way_comparison, run_predetermined_benchmark
+    from piia.intelligence.judgment.evidence import collect_judgment_inputs, generate_demo_judgment_inputs
+    if replay_eval:
+        return run_predetermined_benchmark(starting_cash=float(starting_cash), call_live_model=bool(call_live_model))
+    bundle = generate_demo_judgment_inputs() if demo else collect_judgment_inputs()
+    return {
+        "starting_cash_usdt": float(starting_cash),
+        "four_way_comparison": run_four_way_comparison(bundle, call_live_model=call_live_model, starting_cash_usdt=float(starting_cash)),
+        "domain_ablation": run_domain_ablation(bundle, starting_cash=float(starting_cash)),
+        "order_permissions": False,
+    }
+
+
+@app.get("/judgment-v3/replay-nvidia")
+def judgment_v3_replay_nvidia(starting_cash: float = 100.0):
+    import sys
+    root = Path(__file__).resolve().parents[3]
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    from experiments.replay_nvidia_20261123_case import replay_nvidia_20261123_case
+    return replay_nvidia_20261123_case(starting_cash_usdt=float(starting_cash))

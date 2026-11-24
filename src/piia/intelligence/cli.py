@@ -98,6 +98,39 @@ def main(argv: list[str] | None = None) -> int:
     p_aapp.add_argument("--note", default="")
     p_aapp.add_argument("--db", default=None)
     p_aapp.add_argument("--demo", action="store_true", help="decide a proposal stored in the synthetic demo ledger")
+
+    sub.add_parser("judgment-verify-freeze", help="verify SHA-256 integrity manifest of PIIA Judgment v3 modules")
+    p_jrun = sub.add_parser("judgment-run", help="collect 5-domain evidence and record one Judgment v3 shadow cycle")
+    p_jrun.add_argument("--demo", action="store_true", help="run on explicitly labelled synthetic fixture in isolated demo ledger")
+    p_jrun.add_argument("--starting-cash", type=float, default=500.0)
+    p_jrun.add_argument("--supplement-note", default=None, help="optional agent/human supplement (recorded separately; cannot override risk gate)")
+    p_jrun.add_argument("--db", default=None)
+
+    p_jask = sub.add_parser("judgment-ask", help="ask traceable 3-contract or follow-up question bound to a Judgment v3 snapshot")
+    p_jask.add_argument("question", help="e.g. '今天黄金、BTC、纳指 100 看多还是看空？' or '如果美元上升会改判吗？'")
+    p_jask.add_argument("--live", action="store_true", help="use live public snapshot & live shadow ledger")
+    p_jask.add_argument("--demo", action="store_true", help="use synthetic demo snapshot & demo ledger")
+    p_jask.add_argument("--refresh", action="store_true", help="force fresh collection even if current UTC hour was recorded")
+    p_jask.add_argument("--starting-cash", type=float, default=500.0)
+    p_jask.add_argument("--supplement-note", default=None, help="optional agent/human supplement (recorded separately; cannot override risk gate)")
+    p_jask.add_argument("--json", action="store_true", help="print full structured JSON instead of Markdown")
+    p_jask.add_argument("--db", default=None)
+
+    p_jstat = sub.add_parser("judgment-status", help="inspect Judgment v3 shadow ledger status and outcomes")
+    p_jstat.add_argument("--demo", action="store_true")
+    p_jstat.add_argument("--db", default=None)
+
+    p_jab = sub.add_parser("judgment-ablation", help="run 4-way AI comparison, 5-domain leave-one-out ablation, or predetermined 100 USDT eval replay")
+    p_jab.add_argument("--demo", action="store_true")
+    p_jab.add_argument("--replay-eval", action="store_true", help="run predetermined UTC schedule benchmark on eval dataset")
+    p_jab.add_argument("--eval-dir", default=None)
+    p_jab.add_argument("--starting-cash", type=float, default=100.0)
+    p_jab.add_argument("--call-live-model", action="store_true")
+    p_jab.add_argument("--out", default=None)
+
+    p_jnvd = sub.add_parser("judgment-replay-nvidia", help="replay 2026-11-23 NDX100USDT NVIDIA reinstatement case across 4 causal scenarios")
+    p_jnvd.add_argument("--starting-cash", type=float, default=100.0)
+    p_jnvd.add_argument("--out", default=None)
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parents[3]
@@ -337,6 +370,112 @@ def main(argv: list[str] | None = None) -> int:
             args.proposal_id, choice=args.choice, actor=args.actor, note=args.note, db_path=db_p
         )
         print(json.dumps(res, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.cmd == "judgment-verify-freeze":
+        import json
+        from piia.intelligence.judgment.manifest import verify_judgment_v3_frozen
+        res = verify_judgment_v3_frozen()
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+        return 0 if res["ok"] else 2
+    if args.cmd == "judgment-run":
+        import json
+        from piia.intelligence.judgment.evaluation import default_judgment_ledger_path, record_judgment_cycle
+        db_p = Path(args.db) if args.db else default_judgment_ledger_path(demo=args.demo)
+        res = record_judgment_cycle(
+            db_path=db_p,
+            demo_mode=args.demo,
+            starting_cash=args.starting_cash,
+            supplement_note=args.supplement_note,
+        )
+        compact = {k: v for k, v in res.items() if k != "packet"}
+        compact["cutoff_utc"] = res["packet"]["cutoff_utc"]
+        compact["summary"] = {s: {"intraday": res["packet"]["judgments"][s]["intraday"]["final_label_cn"], "swing_1_3d": res["packet"]["judgments"][s]["swing_1_3d"]["final_label_cn"], "paper": res["packet"]["judgments"][s]["paper_eligibility"]["label_cn"]} for s in res["packet"]["judgments"]}
+        print(json.dumps(compact, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.cmd == "judgment-ask":
+        import json
+        from datetime import datetime, timezone
+        from piia.intelligence.judgment.chat_workbench import answer_judgment_query
+        from piia.intelligence.judgment.evaluation import (
+            default_judgment_ledger_path, load_latest_two_packets, log_chat_qa, record_judgment_cycle,
+        )
+        demo_flag = bool(args.demo and not args.live)
+        db_p = Path(args.db) if args.db else default_judgment_ledger_path(demo=demo_flag)
+        cur_hour = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0).isoformat()
+        cur_pkt, prev_pkt = load_latest_two_packets(db_p)
+        need_rec = (
+            args.refresh
+            or bool(args.supplement_note)
+            or cur_pkt is None
+            or (cur_pkt.get("cutoff_utc") != cur_hour and not demo_flag)
+            or abs(float(cur_pkt.get("starting_cash_usdt") or 500.0) - float(args.starting_cash)) > 1e-6
+        )
+        if need_rec:
+            rec = record_judgment_cycle(
+                db_path=db_p,
+                demo_mode=demo_flag,
+                starting_cash=args.starting_cash,
+                supplement_note=args.supplement_note,
+            )
+            loaded_cur, loaded_prev = load_latest_two_packets(db_p)
+            cur_pkt = rec["packet"] if rec.get("status") == "already_recorded_for_hour" else (loaded_cur or rec["packet"])
+            prev_pkt = loaded_prev
+        qa = answer_judgment_query(args.question, packet=cur_pkt, previous_packet=prev_pkt)
+        log_chat_qa(db_p, qa)
+        if args.json:
+            print(json.dumps(qa, indent=2, ensure_ascii=False, default=str))
+        else:
+            print(qa["markdown"])
+        return 0
+    if args.cmd == "judgment-status":
+        import json
+        from piia.intelligence.judgment.evaluation import default_judgment_ledger_path, get_judgment_ledger_status
+        db_p = Path(args.db) if args.db else default_judgment_ledger_path(demo=args.demo)
+        st = get_judgment_ledger_status(db_p, demo=args.demo)
+        printable = {k: v for k, v in st.items() if k != "latest_packet"}
+        print(json.dumps(printable, indent=2, ensure_ascii=False, default=str))
+        return 0
+    if args.cmd == "judgment-ablation":
+        import json
+        from piia.intelligence.judgment.evaluation import run_domain_ablation, run_four_way_comparison, run_predetermined_benchmark
+        from piia.intelligence.judgment.evidence import collect_judgment_inputs, generate_demo_judgment_inputs
+        if args.replay_eval:
+            rep = run_predetermined_benchmark(
+                eval_dir=Path(args.eval_dir) if args.eval_dir else None,
+                starting_cash=float(args.starting_cash),
+                call_live_model=bool(args.call_live_model),
+            )
+        else:
+            bundle = generate_demo_judgment_inputs() if args.demo else collect_judgment_inputs()
+            rep = {
+                "starting_cash_usdt": float(args.starting_cash),
+                "four_way_comparison": run_four_way_comparison(
+                    bundle,
+                    call_live_model=bool(args.call_live_model),
+                    starting_cash_usdt=float(args.starting_cash),
+                ),
+                "domain_ablation": run_domain_ablation(bundle, starting_cash=float(args.starting_cash)),
+            }
+        text_out = json.dumps(rep, indent=2, ensure_ascii=False, default=str)
+        if args.out:
+            p = Path(args.out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text_out + "\n", encoding="utf-8")
+        print(text_out)
+        return 0
+    if args.cmd == "judgment-replay-nvidia":
+        import json
+        import sys
+        if str(root) not in sys.path:
+            sys.path.insert(0, str(root))
+        from experiments.replay_nvidia_20261123_case import replay_nvidia_20261123_case
+        rep = replay_nvidia_20261123_case(starting_cash_usdt=float(args.starting_cash))
+        text_out = json.dumps(rep, indent=2, ensure_ascii=False, default=str)
+        if args.out:
+            p = Path(args.out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text_out + "\n", encoding="utf-8")
+        print(text_out)
         return 0
     return 1
 

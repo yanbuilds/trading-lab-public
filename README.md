@@ -25,6 +25,10 @@
 5. **🎯 个人交易辅助工具箱（`scan` / `plan-trade` / `position-advice`）**
    - 提供三大合约实时盘面雷达、下单前精确张数/含费保本价/`TP1–TP3` 分批止盈阶梯/强平缓冲工单计算器，以及盘中移动止损诊断顾问。
 
+6. **🧭 可追溯多维交易判断与追问工作台（Judgment v3：`src/piia/intelligence/judgment/`）**
+   - 在完全保留 `v2.2.1` 对照不变的前提下（协议见 [PIIA_JUDGMENT_V3_PROTOCOL.md](PIIA_JUDGMENT_V3_PROTOCOL.md)，独立影子账本 `data/piia/piia_judgment_v3_shadow.sqlite`），输出黄金/BTC/纳指 100 **日内**与 **1–3 日**双期限偏多/偏空/观望判断、**纯技术面对照**、**`v2.2.1` 正式信号**与**纸面开仓条件**，覆盖 DXY/DTWEXBGS/DFII10/事件日历、三层市场潮汐、ETF/COT/VIX/SEC EDGAR/链上/Polymarket、已核验新闻与 Chronos/统计基准对照，并支持四臂 AI 对照与五域消融。
+   - 快速命令：`python -m piia judgment-verify-freeze`、`python -m piia judgment-ask "今天黄金、BTC、纳指 100 看多还是看空？" --live`、`python -m experiments.run_judgment_v3_comparison --demo-synthetic`。
+
 ## 快速上手命令
 
 ```powershell
