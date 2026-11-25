@@ -544,6 +544,8 @@ try:
                     st.json({
                         "factor_usage_ledger": jv3_cur.get("factor_usage_ledger"),
                         "macro_summary": {k: v for k, v in jv3_cur["macro_summary"].items() if k != "events"},
+                        "setup_bridge_by_symbol": {s: (jv3_cur["judgments"][s].get("setup_bridge") or {}) for s in ("BTCUSDT", "XAUUSDT", "NDX100USDT")},
+                        "venue_microstructure_audit": {s: (jv3_cur["judgments"][s].get("venue_microstructure_audit") or {}) for s in ("BTCUSDT", "XAUUSDT", "NDX100USDT")},
                         "forecast_and_models": jv3_cur["forecast_and_models"],
                         "news_audit_top6": jv3_cur.get("news_audit", [])[:6],
                     })

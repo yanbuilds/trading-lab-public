@@ -9,14 +9,14 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[4]
 
 PINNED_SHA256 = {
-    "PIIA_JUDGMENT_V3_PROTOCOL.md": "679a6bb09b40c21b988d2927106560809d3b4bebf1f1bd5c684d32336b369dad",
-    "config/piia_judgment_v3.yaml": "2249f32273f09de677f5b78e4552fbba18e670644363fb28fc4c316282ca3123",
+    "PIIA_JUDGMENT_V3_PROTOCOL.md": "d66bd9102c233fbe710c1b4f84b7c64c62c154e0eb6b0eab0af586d4c6f7cd8f",
+    "config/piia_judgment_v3.yaml": "a709198eb5ec43ea89b80ec3d887a27194c867d03b2aae7df2f68ffc5f10263a",
     "src/piia/intelligence/judgment/news.py": "4bb8ecd0d46e3016cdd502517ac42a458a0841065ab84e963d092a32f828c0c3",
-    "src/piia/intelligence/judgment/evidence.py": "0fb573743d677517ab2b7e6f39b35c7530a4abd2c7026c355cd4a483859593c6",
+    "src/piia/intelligence/judgment/evidence.py": "7b438676b023e57299d1a8ccae97fb4381c37b5577e0cdcd8e7efdc7eb2f4ef2",
     "src/piia/intelligence/judgment/tide.py": "88fda335b845915eebad16db4f4841c6fcdf8b0aae004f60c149776755a059fb",
-    "src/piia/intelligence/judgment/synthesizer.py": "eec3b3e378d5f381ba8c86e432ea6505967c324d081ec9ebe144284384fb0ba4",
-    "src/piia/intelligence/judgment/chat_workbench.py": "70df54bada077938f8ec9c076e704d2cd1d709a8da06ef8e70663b06111c661c",
-    "src/piia/intelligence/judgment/evaluation.py": "0a511066fb6c29b256bf1eedd9ff6e5d97903840b71352d9bd5b839396117cf2",
+    "src/piia/intelligence/judgment/synthesizer.py": "57e2251e53ff4a0ace52447e9b37a3740b5616cf0e16279581813598d2b41fa9",
+    "src/piia/intelligence/judgment/chat_workbench.py": "733fee0fc9268c69afdb45ca0a218fb2d0307ee4ce745c5bafe4c552610b250c",
+    "src/piia/intelligence/judgment/evaluation.py": "0763db831f92a652307dd4909e46b521e5297ab6a52b79f403f05608bffbaefd",
     "experiments/replay_nvidia_20261123_case.py": "1fe93603fbe88742eb96a95f553ef550917a78d3d99972b4cff2d2f0d36a0a85",
 }
 

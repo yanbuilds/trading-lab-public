@@ -77,6 +77,19 @@ def build_summary_table_rows(packet: dict[str, Any]) -> list[dict[str, Any]]:
     return rows
 
 
+def _dedup_join(items: list[str], limit: int, empty: str = "无") -> str:
+    seen: set[str] = set()
+    out: list[str] = []
+    for item in items:
+        s = str(item or "").strip()
+        if s and s not in seen:
+            seen.add(s)
+            out.append(s)
+            if len(out) >= limit:
+                break
+    return "; ".join(out) if out else empty
+
+
 def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
     table_rows = build_summary_table_rows(packet)
     lc = packet.get("lifecycle_timestamps") or {}
@@ -97,11 +110,21 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
 
     tide = packet["tide"]
     macro = packet["macro_summary"]
+    dxy_str = (
+        "可用"
+        if macro.get("ice_dxy_available")
+        else f"缺失/不可用，盘中延迟代理 DX-Y.NYB={macro.get('intraday_dollar_dx_y_nyb')}（24h {macro.get('intraday_dollar_dx_y_nyb_pct_24h')}%）| 滞后日频 DTWEXBGS={macro.get('broad_dollar_dtwexbgs')}"
+    )
+    tnx_str = (
+        f"^TNX={macro.get('intraday_tnx_pct')}%（24h {macro.get('intraday_tnx_delta_24h_bps')} bps）；"
+        if macro.get("intraday_tnx_pct") is not None
+        else ""
+    )
     lines.extend(
         [
             "",
             "#### 宏观与市场潮汐三层状态",
-            f"- **大环境**：{tide['macro_backdrop']['state_cn']}（ICE DXY：`{'可用' if macro['ice_dxy_available'] else '缺失/不可用，改用滞后代理 DTWEXBGS=' + str(macro.get('broad_dollar_dtwexbgs'))}`；10Y日频实际利率 `DFII10`：{macro.get('real_yield_dfii10_pct')}%，5日变动 {macro.get('real_yield_delta_5obs_bps')} bps）",
+            f"- **大环境**：{tide['macro_backdrop']['state_cn']}（ICE DXY：{dxy_str}；{tnx_str}10Y日频实际利率 `DFII10`：{macro.get('real_yield_dfii10_pct')}%，5日变动 {macro.get('real_yield_delta_5obs_bps')} bps）",
             f"- **宏观分化机制（黄金 vs 纳指）**：{macro['gold_vs_ndx_divergence_note']}",
             f"- **当前市场阶段**：{tide['cycle_stage']['stage_cn']} — 依据定义：`{tide['cycle_stage']['definition_used']}`",
             "",
@@ -113,18 +136,22 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
         pos = tide["instrument_positions"][sym]
         i_d, s_d = j["intraday"], j["swing_1_3d"]
         chg_evs = j.get("evidence_that_changed_conclusion") or []
-        chg_txt = "; ".join(f"[{c.get('horizon')}] {c.get('detail')}" for c in chg_evs[:3]) or "无外部因子推翻纯技术面"
+        chg_txt = _dedup_join([f"[{c.get('horizon')}] {c.get('detail')}" for c in chg_evs], 4, "无外部因子推翻纯技术面")
         supp = j.get("agent_or_human_supplement") or packet.get("agent_or_human_supplement") or {}
         supp_txt = f"{supp.get('actor')}: {supp.get('note')} ({supp.get('recorded_at_utc')}, 不可绕过风控)" if supp.get("provided") else "无"
+        sb = j.get("setup_bridge") or {}
+        va = j.get("venue_microstructure_audit") or {}
         lines.extend(
             [
                 f"##### {SYMBOL_LABELS[sym]}（位置：`{pos['structure_kind_cn']}`）",
                 f"- **日内**：**{i_d['final_label_cn']}**（技术面：{i_d['technical_only']['label_cn']}）—— {i_d['why_changed_or_unchanged_vs_technical']}",
                 f"- **未来 1-3 个交易日**：**{s_d['final_label_cn']}**（技术面：{s_d['technical_only']['label_cn']}）—— {s_d['why_changed_or_unchanged_vs_technical']}",
                 f"- **改变结论的证据**：{chg_txt}",
-                f"- **关键依据**：{'; '.join(i_d['supporting_evidence'][:2] + s_d['supporting_evidence'][:2])}",
-                f"- **最强反证**：{'; '.join(s_d['strongest_counterevidence'][:2])}",
-                f"- **失效与改判条件**：{'; '.join(s_d['invalidation_conditions'][:2])}",
+                f"- **关键依据**：{_dedup_join(list(i_d['supporting_evidence']) + list(s_d['supporting_evidence']), 4)}",
+                f"- **最强反证**：{_dedup_join(list(i_d['strongest_counterevidence']) + list(s_d['strongest_counterevidence']), 3)}",
+                f"- **失效与改判条件**：{_dedup_join(list(i_d['invalidation_conditions']) + list(s_d['invalidation_conditions']), 3)}",
+                f"- **研究→开仓等待条件 (v2.2.1)**：{sb.get('summary_cn') or '无'}",
+                f"- **交易所微观结构盘口/资金费率**：{va.get('summary_cn') or '未采集'}",
                 f"- **数据缺口**：{', '.join(sorted(set(i_d['data_gaps'] + s_d['data_gaps']))) or '无关键缺失'}",
                 f"- **人工/Agent 补充判断**：{supp_txt}",
             ]
@@ -207,6 +234,9 @@ def _render_why_not_direction(question: str, packet: dict[str, Any]) -> dict[str
                 reasons.append(f"{h_label}反证/阻力：{hd['strongest_counterevidence'][0]}")
         reasons.append(f"标的多周期位置：{pos['structure_kind_cn']}（1D={pos['daily_dir']}, 4H={pos['h4_dir']}, 1H={pos['h1_dir']}）")
         reasons.append(f"v2.2.1 正式策略信号：`{j['official_v2_2_1_signal']}`（reason={j['official_v2_2_1_reason']}），纸面开仓条件：{'满足' if j['paper_eligibility']['eligible'] else '不满足'}")
+        sb = j.get("setup_bridge") or {}
+        if sb.get("summary_cn"):
+            reasons.append(f"距离 v2.2.1 正式触发条件：{sb['summary_cn']}")
         details[sym] = {
             "intraday_bias": i_d["final_bias"],
             "swing_bias": s_d["final_bias"],

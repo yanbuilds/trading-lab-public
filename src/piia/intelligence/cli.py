@@ -131,6 +131,20 @@ def main(argv: list[str] | None = None) -> int:
     p_jnvd = sub.add_parser("judgment-replay-nvidia", help="replay 2026-11-23 NDX100USDT NVIDIA reinstatement case across 4 causal scenarios")
     p_jnvd.add_argument("--starting-cash", type=float, default=100.0)
     p_jnvd.add_argument("--out", default=None)
+
+    p_jcap = sub.add_parser("judgment-capture-hourly", help="capture and archive current UTC hour 5-domain bundle idempotently")
+    p_jcap.add_argument("--demo", action="store_true")
+    p_jcap.add_argument("--starting-cash", type=float, default=100.0)
+    p_jcap.add_argument("--supplement-note", default=None)
+    p_jcap.add_argument("--db", default=None)
+    p_jcap.add_argument("--out", default=None)
+
+    p_jrarch = sub.add_parser("judgment-replay-archived", help="replay all archived 5-domain PIT bundles stored in Judgment v3 SQLite ledger")
+    p_jrarch.add_argument("--demo", action="store_true")
+    p_jrarch.add_argument("--starting-cash", type=float, default=100.0)
+    p_jrarch.add_argument("--no-ablation", action="store_true")
+    p_jrarch.add_argument("--db", default=None)
+    p_jrarch.add_argument("--out", default=None)
     args = parser.parse_args(argv)
 
     root = Path(__file__).resolve().parents[3]
@@ -470,6 +484,51 @@ def main(argv: list[str] | None = None) -> int:
             sys.path.insert(0, str(root))
         from experiments.replay_nvidia_20261123_case import replay_nvidia_20261123_case
         rep = replay_nvidia_20261123_case(starting_cash_usdt=float(args.starting_cash))
+        text_out = json.dumps(rep, indent=2, ensure_ascii=False, default=str)
+        if args.out:
+            p = Path(args.out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text_out + "\n", encoding="utf-8")
+        print(text_out)
+        return 0
+    if args.cmd == "judgment-capture-hourly":
+        import json
+        from piia.intelligence.judgment.evaluation import default_judgment_ledger_path, record_judgment_cycle
+        db_p = Path(args.db) if args.db else default_judgment_ledger_path(demo=args.demo)
+        res = record_judgment_cycle(
+            db_path=db_p,
+            demo_mode=args.demo,
+            starting_cash=float(args.starting_cash),
+            supplement_note=args.supplement_note,
+        )
+        pkt = res["packet"]
+        compact = {k: v for k, v in res.items() if k != "packet"}
+        compact["cutoff_utc"] = pkt["cutoff_utc"]
+        compact["summary"] = {
+            s: {
+                "intraday": pkt["judgments"][s]["intraday"]["final_label_cn"],
+                "swing_1_3d": pkt["judgments"][s]["swing_1_3d"]["final_label_cn"],
+                "paper": pkt["judgments"][s]["paper_eligibility"]["label_cn"],
+            }
+            for s in pkt["judgments"]
+        }
+        text_out = json.dumps(compact, indent=2, ensure_ascii=False, default=str)
+        if args.out:
+            p = Path(args.out)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(text_out + "\n", encoding="utf-8")
+        print(text_out)
+        return 0
+    if args.cmd == "judgment-replay-archived":
+        import json
+        from piia.intelligence.judgment.evaluation import default_judgment_ledger_path, replay_archived_judgment_ledger
+        db_p = Path(args.db) if args.db else default_judgment_ledger_path(demo=args.demo)
+        rep = replay_archived_judgment_ledger(
+            db_p,
+            demo=bool(args.demo),
+            starting_cash=float(args.starting_cash),
+            run_ablation=not bool(args.no_ablation),
+        )
         text_out = json.dumps(rep, indent=2, ensure_ascii=False, default=str)
         if args.out:
             p = Path(args.out)

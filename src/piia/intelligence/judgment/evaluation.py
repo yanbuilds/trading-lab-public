@@ -47,7 +47,7 @@ ROOT = Path(__file__).resolve().parents[4]
 REAL_JUDGMENT_LEDGER_PATH = ROOT / "data" / "piia" / "piia_judgment_v3_shadow.sqlite"
 DEMO_JUDGMENT_LEDGER_PATH = ROOT / "data" / "piia" / "piia_judgment_v3_demo.sqlite"
 JUDGMENT_APP_ID = 0x50494A33  # "PIJ3"
-JUDGMENT_SCHEMA_VERSION = "piia_judgment_v3_2"
+JUDGMENT_SCHEMA_VERSION = "piia_judgment_v3_3"
 
 KIND_LIVE_J3 = "live_shadow_judgment_v3"
 KIND_DEMO_J3 = "demo_synthetic_judgment_v3"
@@ -176,6 +176,15 @@ def _init_judgment_db(db_path: Path, *, ledger_kind: str | None = None) -> sqlit
             question TEXT NOT NULL,
             answer_json TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS archived_input_bundles (
+            bundle_id TEXT PRIMARY KEY,
+            packet_id TEXT NOT NULL,
+            cutoff_utc TEXT NOT NULL UNIQUE,
+            captured_at_utc TEXT NOT NULL,
+            ledger_kind TEXT NOT NULL,
+            bundle_sha256 TEXT NOT NULL,
+            bundle_json TEXT NOT NULL
+        );
 
         CREATE TRIGGER IF NOT EXISTS j3_meta_upd BEFORE UPDATE ON ledger_meta BEGIN SELECT RAISE(ABORT, 'append-only'); END;
         CREATE TRIGGER IF NOT EXISTS j3_meta_del BEFORE DELETE ON ledger_meta BEGIN SELECT RAISE(ABORT, 'append-only'); END;
@@ -189,6 +198,8 @@ def _init_judgment_db(db_path: Path, *, ledger_kind: str | None = None) -> sqlit
         CREATE TRIGGER IF NOT EXISTS j3_evt_del BEFORE DELETE ON shadow_paper_events BEGIN SELECT RAISE(ABORT, 'append-only'); END;
         CREATE TRIGGER IF NOT EXISTS j3_qa_upd BEFORE UPDATE ON chat_qa_logs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
         CREATE TRIGGER IF NOT EXISTS j3_qa_del BEFORE DELETE ON chat_qa_logs BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS j3_arch_upd BEFORE UPDATE ON archived_input_bundles BEGIN SELECT RAISE(ABORT, 'append-only'); END;
+        CREATE TRIGGER IF NOT EXISTS j3_arch_del BEFORE DELETE ON archived_input_bundles BEGIN SELECT RAISE(ABORT, 'append-only'); END;
         """
     )
     existing_arm_cols = {r[1] for r in conn.execute("PRAGMA table_info(arm_judgments)").fetchall()}
@@ -323,6 +334,13 @@ def _resolve_pending_outcomes(
     return resolved_n
 
 
+def _normalize_bundle_for_archive(inputs_bundle: dict[str, Any]) -> tuple[str, str]:
+    cleaned = {k: v for k, v in inputs_bundle.items() if k != "_from_live_collector"}
+    cleaned["replay_mode"] = False
+    bundle_sha = canonical_sha256(cleaned)
+    return json.dumps(cleaned, ensure_ascii=False, default=str), bundle_sha
+
+
 def record_judgment_cycle(
     inputs_bundle: dict[str, Any] | None = None,
     *,
@@ -381,17 +399,34 @@ def record_judgment_cycle(
             now_cutoff=cutoff_dt,
             resolved_at_iso=now_iso,
         )
+        archive_json, bundle_sha = _normalize_bundle_for_archive(inputs_bundle)
         existing = conn.execute(
             "SELECT packet_id, judgment_hash FROM judgment_packets WHERE cutoff_utc = ?",
             (packet["cutoff_utc"],),
         ).fetchone()
         if existing is not None:
+            conn.execute(
+                """
+                INSERT OR IGNORE INTO archived_input_bundles(bundle_id, packet_id, cutoff_utc, captured_at_utc, ledger_kind, bundle_sha256, bundle_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(uuid.uuid4()),
+                    existing["packet_id"],
+                    packet["cutoff_utc"],
+                    str(inputs_bundle.get("collected_at_utc") or now_iso),
+                    required_kind,
+                    bundle_sha,
+                    archive_json,
+                ),
+            )
             conn.commit()
             return {
                 "status": "already_recorded_for_hour",
                 "packet_id": existing["packet_id"],
                 "cutoff_utc": packet["cutoff_utc"],
                 "judgment_hash": existing["judgment_hash"],
+                "archived_bundle_sha256": bundle_sha,
                 "outcomes_resolved": resolved_prior,
                 "packet": packet,
                 "db_path": _display_path(db_path),
@@ -405,6 +440,21 @@ def record_judgment_cycle(
             VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (packet_id, packet["cutoff_utc"], now_iso, mode, cfg["version"], packet["judgment_hash"], json.dumps(packet, ensure_ascii=False, default=str)),
+        )
+        conn.execute(
+            """
+            INSERT INTO archived_input_bundles(bundle_id, packet_id, cutoff_utc, captured_at_utc, ledger_kind, bundle_sha256, bundle_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                str(uuid.uuid4()),
+                packet_id,
+                packet["cutoff_utc"],
+                str(inputs_bundle.get("collected_at_utc") or now_iso),
+                required_kind,
+                bundle_sha,
+                archive_json,
+            ),
         )
 
         # Store pre-outcome directional arms (`A0_technical_only` and `A3_project_full_judgment_v3`)
@@ -471,6 +521,7 @@ def record_judgment_cycle(
         "packet_id": packet_id,
         "cutoff_utc": packet["cutoff_utc"],
         "judgment_hash": packet["judgment_hash"],
+        "archived_bundle_sha256": bundle_sha,
         "outcomes_resolved": resolved_prior,
         "packet": packet,
         "db_path": _display_path(db_path),
@@ -547,6 +598,8 @@ def get_judgment_ledger_status(db_path: Path | None = None, *, demo: bool = Fals
         meta_row = conn.execute("SELECT value FROM ledger_meta WHERE key='ledger_kind'").fetchone()
         kind = str(meta_row[0]) if meta_row else "unknown"
         pkts = conn.execute("SELECT cutoff_utc, version, judgment_hash, packet_json FROM judgment_packets ORDER BY cutoff_utc DESC").fetchall()
+        has_arch = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archived_input_bundles'").fetchone())
+        arch_count = int(conn.execute("SELECT COUNT(*) FROM archived_input_bundles").fetchone()[0]) if has_arch else 0
         out_rows = conn.execute(
             "SELECT arm_name, COUNT(*) AS n, SUM(CASE WHEN direction_hit=1 THEN 1 ELSE 0 END) AS hits, "
             "SUM(CASE WHEN direction_hit IS NOT NULL THEN 1 ELSE 0 END) AS scored, AVG(realized_return_pct) AS avg_ret "
@@ -578,6 +631,7 @@ def get_judgment_ledger_status(db_path: Path | None = None, *, demo: bool = Fals
         "db_path": _display_path(db_path),
         "ledger_kind": kind,
         "packets_recorded": len(pkts),
+        "archived_bundles_count": arch_count,
         "current_version_packets": len(cur_ver_cutoffs),
         "max_contiguous_hours": max_contig,
         "all_packets_max_contiguous_hours": all_stats["max_contiguous_hours"],
@@ -1693,3 +1747,122 @@ def run_predetermined_benchmark(
         "holdout_window": holdout_res,
         "order_permissions": False,
     }
+
+
+_PIT_VERIFIED_ARCHIVE_DOMAINS = (
+    "intraday_macro",
+    "fear_greed",
+    "etf_flows",
+    "onchain",
+    "exchange_netflow",
+    "gold_cot",
+    "polymarket",
+)
+
+
+def replay_archived_judgment_ledger(
+    db_path: Path | None = None,
+    *,
+    demo: bool = False,
+    starting_cash: float = 100.0,
+    run_ablation: bool = True,
+) -> dict[str, Any]:
+    """Reconstruct and score full 5-domain archived point-in-time judgment snapshots without lookahead."""
+    target_db = Path(db_path) if db_path is not None else default_judgment_ledger_path(demo=demo)
+    if not target_db.is_file():
+        return {
+            "status": "NO_ARCHIVED_LEDGER",
+            "db_path": _display_path(target_db),
+            "archived_bundles_count": 0,
+            "starting_cash_usdt": float(starting_cash),
+            "order_permissions": False,
+        }
+
+    conn = sqlite3.connect(f"{target_db.resolve().as_uri()}?mode=ro", uri=True)
+    conn.row_factory = sqlite3.Row
+    try:
+        has_arch = bool(conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='archived_input_bundles'").fetchone())
+        rows = (
+            conn.execute(
+                "SELECT cutoff_utc, captured_at_utc, bundle_sha256, bundle_json FROM archived_input_bundles ORDER BY cutoff_utc ASC"
+            ).fetchall()
+            if has_arch
+            else []
+        )
+    finally:
+        conn.close()
+
+    if not rows:
+        return {
+            "status": "NO_ARCHIVED_BUNDLES",
+            "db_path": _display_path(target_db),
+            "archived_bundles_count": 0,
+            "starting_cash_usdt": float(starting_cash),
+            "order_permissions": False,
+        }
+
+    bundles: list[dict[str, Any]] = []
+    bundle_hashes: list[str] = []
+    for row in rows:
+        raw_b = json.loads(row["bundle_json"])
+        raw_b["replay_mode"] = True
+        for k in _PIT_VERIFIED_ARCHIVE_DOMAINS:
+            sub = raw_b.get(k)
+            if isinstance(sub, dict):
+                sub["historical_point_in_time_verified"] = True
+        bundles.append(raw_b)
+        bundle_hashes.append(str(row["bundle_sha256"]))
+
+    packets = [
+        synthesize_judgment_packet(b, include_v2_control=True, starting_cash_usdt=float(starting_cash), replay_mode=True)
+        for b in bundles
+    ]
+    pairs = [(pkt, b["market_snapshot"]) for pkt, b in zip(packets, bundles)]
+    cutoffs = [pkt["cutoff_utc"] for pkt in packets]
+    contig = _compute_contiguous_stats(cutoffs)
+
+    arms = {
+        "A0_technical_only": {
+            "shadow_paper_1x_slip": _simulate_shadow_paper_sequence(pairs, arm_selector="tech", starting_cash=float(starting_cash), slippage_mult=1.0),
+            "shadow_paper_2x_slip": _simulate_shadow_paper_sequence(pairs, arm_selector="tech", starting_cash=float(starting_cash), slippage_mult=2.0),
+            "post_maturity_accuracy": _compute_sequence_directional_accuracy(pairs, arm_selector="tech"),
+        },
+        "A3_project_full_judgment_v3": {
+            "shadow_paper_1x_slip": _simulate_shadow_paper_sequence(pairs, arm_selector="full", starting_cash=float(starting_cash), slippage_mult=1.0),
+            "shadow_paper_2x_slip": _simulate_shadow_paper_sequence(pairs, arm_selector="full", starting_cash=float(starting_cash), slippage_mult=2.0),
+            "post_maturity_accuracy": _compute_sequence_directional_accuracy(pairs, arm_selector="full"),
+        },
+        "v2_2_1_official_control": {
+            "shadow_paper_1x_slip": _simulate_shadow_paper_sequence(pairs, arm_selector="v2_official", starting_cash=float(starting_cash), slippage_mult=1.0, respect_pending_review=False),
+            "shadow_paper_2x_slip": _simulate_shadow_paper_sequence(pairs, arm_selector="v2_official", starting_cash=float(starting_cash), slippage_mult=2.0, respect_pending_review=False),
+        },
+    }
+    last_inst = ((bundles[-1].get("market_snapshot") or {}).get("instruments") or {})
+    port_audit = evaluate_portfolio_risk_audit(
+        {sym: ((last_inst.get(sym) or {}).get("candles_closed_1h")) or [] for sym in SYMBOLS},
+        [
+            {"symbol": sym, **packets[-1]["judgments"][sym]["paper_eligibility"]["position_sizing"]}
+            for sym in SYMBOLS
+            if (packets[-1]["judgments"][sym]["paper_eligibility"].get("eligible"))
+        ],
+        equity_usdt=float(starting_cash),
+    )
+
+    out: dict[str, Any] = {
+        "status": "replayed_archived_5_domain_bundles",
+        "protocol_version": JUDGMENT_SCHEMA_VERSION,
+        "db_path": _display_path(target_db),
+        "replay_non_blind_5_domains": True,
+        "archived_bundles_count": len(bundles),
+        "earliest_cutoff_utc": cutoffs[0],
+        "latest_cutoff_utc": cutoffs[-1],
+        "contiguous_stats": contig,
+        "starting_cash_usdt": float(starting_cash),
+        "latest_bundle_sha256": bundle_hashes[-1],
+        "arms": arms,
+        "portfolio_risk_audit": port_audit,
+        "order_permissions": False,
+    }
+    if run_ablation:
+        out["domain_ablation"] = run_domain_ablation(bundles[0], replay_sequence=bundles, starting_cash=float(starting_cash))
+    return out
