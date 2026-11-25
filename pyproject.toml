@@ -32,3 +32,6 @@ where = ["src"]
 testpaths = ["tests"]
 pythonpath = ["src"]
 addopts = "-q"
+filterwarnings = [
+  "ignore:Converting to Period representation will drop timezone information:UserWarning:trading_lab\\.perps\\.compare",
+]

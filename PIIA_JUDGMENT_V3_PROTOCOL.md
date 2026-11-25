@@ -1,6 +1,6 @@
-# PIIA Judgment v3.1.0 — 可追溯多因子跨周期交易判断、对话工作台与公平对比协议
+# PIIA Judgment v3.2.0 — 可追溯多因子跨周期交易判断、对话工作台与公平对比协议
 
-> **状态：研究与影子纸面验证模块（不改冻结基线，不自动下单）**。本协议以 `main` 上已合并的 PIIA v2.2.1（`74ce2eeb0c9ae759001030272fec91ec3992a415`）为对照组，完整保留 `v2.2.1` 与 [FROZEN_POLICY_V1.md](FROZEN_POLICY_V1.md) 的源码、配置和账本不受任何修改。Judgment v3.1.0 使用独立配置文件 [config/piia_judgment_v3.yaml](config/piia_judgment_v3.yaml) 与独立影子账本 `data/piia/piia_judgment_v3_shadow.sqlite`（演示用 `data/piia/piia_judgment_v3_demo.sqlite`），无任何实盘或交易所模拟下单权限。
+> **状态：研究与影子纸面验证模块（不改冻结基线，不自动下单）**。本协议以 `main` 上已合并的 PIIA v2.2.1（`74ce2eeb0c9ae759001030272fec91ec3992a415`）为对照组，完整保留 `v2.2.1` 与 [FROZEN_POLICY_V1.md](FROZEN_POLICY_V1.md) 的源码、配置和账本不受任何修改。Judgment v3.2.0 使用独立配置文件 [config/piia_judgment_v3.yaml](config/piia_judgment_v3.yaml) 与独立影子账本 `data/piia/piia_judgment_v3_shadow.sqlite`（演示用 `data/piia/piia_judgment_v3_demo.sqlite`），无任何实盘或交易所模拟下单权限。
 
 ## 1. 五时间戳生命周期与无前视纪律
 
@@ -60,3 +60,10 @@
 
 - **四臂同快照对比**：`A0_technical_only`（纯技术面）、`A1_direct_ai_candles_only`（仅相同前缀闭合行情+任务说明，不给外部数据包与未来数据）、`A2_ai_freeform_same_packet`（与规则引擎相同 `EvidenceAtom` 数据包但由 AI 自由综合）、`A3_project_full_judgment_v3`（完整规则综合），以此区分“信息覆盖”与“规则合成”的各自贡献。未配置官方模型 API 时，AI 臂如实记为 `NOT_RUN_NEEDS_MODEL_CONFIG`。
 - **五域逐一剔除消融**：`Full`、`No_Macro`、`No_Tide`、`No_Sentiment_Flow`、`No_News`、`No_Forecast`、`Technical_Only`，统计方向分布、覆盖率、观望率、决策改变明细，以及在成熟窗口后的命中表现与影子纸面账户（`500 USDT`、`1x` 与 `2x` 滑点、严格资金费审计）表现；在连续 168 小时前瞻积累与结果成熟前，验证状态保持 **待验证**。
+
+## 7. v3.2.0 实盘核验、盘中代理、微观风控与全五域归档增强
+
+- **宏观日程公布严格匹配与盘后脉冲代理**：`actual` 仅允许匹配满足“同发布机构 + 发布时间处于 `[scheduled_at - 15m, min(cutoff, scheduled_at + 12h)]` + 去除通用月份/次序词后的特定主题词重叠”的已核验公报；未到发布时刻严禁错配旧闻。官方缺少市场一致预期时，在发布后 `0~6h` 窗口内补充 `post_release_market_reaction`（实测涨跌幅与 ATR 倍数），不伪造华尔街预期值。
+- **可核验盘中代理与 CoinMetrics 时点净流**：保留 `macro:ice_dxy` 与 `macro:real_yield_intraday` 商业源缺失标注不混用；新增 Yahoo 1h（严格切片 `<= bar_cutoff_utc`）`DX-Y.NYB` 美元期货、`^TNX`/`TIP` 盘中美债利率/TIPS 代理、`QQEW` vs `QQQ` 等权相对Cap-Weight科技股广度代理，以及 CoinMetrics 社区 API（严格按 `status-time <= decision_cutoff_utc` 验证时点可用性）的 BTC 交易所净流入/流出 `FlowInExNtv - FlowOutExNtv`。
+- **研究→开仓等待桥梁（`setup_bridge`）与交易所微观风控（`venue_microstructure`）**：每个品种明确计算距冻结 `v2.2.1` 规则触发（`trend_pullback`、`trend_breakout`、`range_reversion`）还差的具体指标与价位；实时审计 Bitget `markPrice` 偏离 `lastPr`（`>=50 bps` 标为 `pending_review`）及 `fundingRateInterval`（非 `8h` 动态费率周期标为 `pending_review`）与实时维持保证金档位。
+- **全五域完整入库归档与非致盲回放（`archived_input_bundles`）**：每次 `record_judgment_cycle`（含 `judgment-capture-hourly` 单小时幂等采集）均在 append-only 触发器保护下归档真实采集的多维输入束，`replay_archived_judgment_ledger` / `judgment-replay-archived` 可在完整保留五域实时证据的归档序列上直接复算四臂对比与消融实验。

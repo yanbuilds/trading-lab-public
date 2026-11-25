@@ -609,3 +609,14 @@ def judgment_v3_replay_nvidia(starting_cash: float = 100.0):
         sys.path.insert(0, str(root))
     from experiments.replay_nvidia_20261123_case import replay_nvidia_20261123_case
     return replay_nvidia_20261123_case(starting_cash_usdt=float(starting_cash))
+
+
+@app.get("/judgment-v3/replay-archived")
+def judgment_v3_replay_archived(demo: bool = False, starting_cash: float = 100.0, run_ablation: bool = True):
+    from piia.intelligence.judgment.evaluation import replay_archived_judgment_ledger
+    return replay_archived_judgment_ledger(
+        _resolve_judgment_v3_ledger(demo),
+        demo=demo,
+        starting_cash=float(starting_cash),
+        run_ablation=bool(run_ablation),
+    )

@@ -7,6 +7,7 @@ import json
 import sqlite3
 
 from fastapi.testclient import TestClient
+import httpx
 import pandas as pd
 import pytest
 
@@ -18,12 +19,28 @@ from piia.intelligence.judgment.evaluation import (
     get_judgment_ledger_status,
     load_latest_two_packets,
     record_judgment_cycle,
+    replay_archived_judgment_ledger,
     run_domain_ablation,
     run_four_way_comparison,
 )
-from piia.intelligence.judgment.evidence import generate_demo_judgment_inputs
+from piia.intelligence.judgment.evidence import (
+    build_forecast_and_model_evidence,
+    build_macro_evidence,
+    build_sentiment_flow_evidence,
+    fetch_bitget_venue_microstructure,
+    fetch_coinmetrics_btc_exchange_flows,
+    fetch_yahoo_intraday_macro_and_breadth,
+    generate_demo_judgment_inputs,
+    load_judgment_config,
+    validate_atom_temporal_bounds,
+    validate_market_snapshot_coherence,
+)
 from piia.intelligence.judgment.manifest import verify_judgment_v3_frozen
-from piia.intelligence.judgment.synthesizer import synthesize_judgment_packet
+from piia.intelligence.judgment.synthesizer import (
+    _apply_v3_paper_review_gate,
+    _audit_venue_microstructure,
+    synthesize_judgment_packet,
+)
 
 
 def test_frozen_v1_and_v2_2_1_controls_remain_untouched_and_judgment_v3_passes():
@@ -799,4 +816,402 @@ def test_fair_100_usdt_shadow_simulation_min_qty_funding_portfolio_audit_and_cli
     assert cur_p is not None and cur_p["starting_cash_usdt"] == 100.0
     assert cur_p["agent_or_human_supplement"]["note"] == "CLI test supplement"
     assert cur_p["agent_or_human_supplement"]["can_override_risk_gate"] is False
+
+
+def test_strict_calendar_release_matching_and_post_release_reaction():
+    cfg = load_judgment_config()
+    bundle = generate_demo_judgment_inputs()
+    cutoff = datetime(2026, 11, 25, 12, 0, tzinfo=timezone.utc)
+    demo_base = pd.Timestamp(bundle["cutoff_utc"]).to_pydatetime()
+    frames_1h = validate_market_snapshot_coherence(bundle["market_snapshot"], cutoff_utc=demo_base)["frames_1h"]
+    # Shift one frame close index around our synthetic 10:00Z..12:00Z release window
+    shift_delta = cutoff - demo_base
+    shifted_frames = {}
+    for sym, df in frames_1h.items():
+        sdf = df.copy()
+        sdf.index = sdf.index + shift_delta
+        shifted_frames[sym] = sdf
+
+    cal = {
+        "present_sources": ["bea", "bls"],
+        "retrieved_at_utc": cutoff.isoformat(),
+        "sources": {
+            "bea": {
+                "source_url": "https://www.bea.gov/news/schedule",
+                "window_events": [
+                    {
+                        "agency": "BEA",
+                        "title": "Gross Domestic Product (Second Estimate), Q3",
+                        "scheduled_at_utc": (cutoff + timedelta(hours=3)).isoformat(),
+                    },
+                    {
+                        "agency": "BEA",
+                        "title": "Personal Income and Outlays (PCE)",
+                        "scheduled_at_utc": (cutoff - timedelta(hours=2)).isoformat(),
+                    },
+                ],
+            },
+            "bls": {
+                "source_url": "https://www.bls.gov/schedule/news_release/",
+                "window_events": [
+                    {
+                        "agency": "BLS",
+                        "title": "Employment Situation",
+                        "scheduled_at_utc": (cutoff - timedelta(hours=1)).isoformat(),
+                    }
+                ],
+            },
+        },
+    }
+    verified_news = [
+        # Older Sep 16 Fed FOMC release MUST NOT match future Nov 25 BEA event
+        {
+            "news_id": "fed_old",
+            "title": "Federal Reserve issues FOMC statement",
+            "url": "https://www.federalreserve.gov/newsevents/pressreleases/monetary20260916a.htm",
+            "published_at_utc": "2026-09-16T18:00:00+00:00",
+            "retrieved_at_utc": cutoff.isoformat(),
+            "source_name": "Federal Reserve",
+            "verification_status": "verified",
+            "freshness_status": "stale_excluded",
+            "news_kind": "primary_release",
+            "affected_symbols": ["BTCUSDT", "XAUUSDT", "NDX100USDT"],
+            "eligible_horizons": ["intraday", "swing_1_3d"],
+            "bias_by_symbol": {"BTCUSDT": "neutral", "XAUUSDT": "neutral", "NDX100USDT": "neutral"},
+        },
+        # Genuine BEA Personal Income & Outlays release right after scheduled time
+        {
+            "news_id": "bea_pce",
+            "title": "Personal Income and Outlays, October",
+            "url": "https://www.bea.gov/news/2026/personal-income-and-outlays",
+            "published_at_utc": (cutoff - timedelta(hours=1, minutes=55)).isoformat(),
+            "retrieved_at_utc": cutoff.isoformat(),
+            "source_name": "Bureau of Economic Analysis",
+            "verification_status": "verified",
+            "freshness_status": "fresh",
+            "news_kind": "primary_release",
+            "affected_symbols": ["BTCUSDT", "XAUUSDT", "NDX100USDT"],
+            "eligible_horizons": ["intraday", "swing_1_3d"],
+            "bias_by_symbol": {"BTCUSDT": "neutral", "XAUUSDT": "neutral", "NDX100USDT": "neutral"},
+        },
+        # Unrelated Fed press release at BLS event timestamp MUST NOT match BEA/BLS
+        {
+            "news_id": "fed_unrel",
+            "title": "Federal Reserve Board announces supervisory update",
+            "url": "https://www.federalreserve.gov/newsevents/pressreleases/other20261125a.htm",
+            "published_at_utc": (cutoff - timedelta(minutes=50)).isoformat(),
+            "retrieved_at_utc": cutoff.isoformat(),
+            "source_name": "Federal Reserve",
+            "verification_status": "verified",
+            "freshness_status": "fresh",
+            "news_kind": "primary_release",
+            "affected_symbols": ["NDX100USDT"],
+            "eligible_horizons": ["intraday"],
+            "bias_by_symbol": {"BTCUSDT": "neutral", "XAUUSDT": "neutral", "NDX100USDT": "neutral"},
+        },
+    ]
+
+    atoms, macro_sum = build_macro_evidence(
+        alfred_series={},
+        dxy_live=None,
+        event_calendar=cal,
+        verified_news=verified_news,
+        vix_summary={},
+        cutoff_utc=cutoff,
+        cfg=cfg,
+        frames_1h=shifted_frames,
+    )
+    by_title = {e["title"]: e for e in macro_sum["events"]}
+    assert by_title["Gross Domestic Product (Second Estimate), Q3"]["actual"]["status"] == "not_yet_released"
+    assert by_title["Gross Domestic Product (Second Estimate), Q3"]["post_release_market_reaction"] is None
+    assert by_title["Personal Income and Outlays (PCE)"]["actual"]["status"] == "released_verified"
+    assert by_title["Personal Income and Outlays (PCE)"]["consensus"]["status"] == "unavailable_in_official_public_feed"
+    rxn = by_title["Personal Income and Outlays (PCE)"]["post_release_market_reaction"]
+    assert rxn is not None and rxn["status"] == "observed_post_release_price_impulse"
+    assert "NDX100USDT" in rxn["by_symbol"] and "ret_since_release_pct" in rxn["by_symbol"]["NDX100USDT"]
+    assert by_title["Employment Situation"]["actual"]["status"] == "release_unverified"
+    cal_atom = next(a for a in atoms if a["evidence_id"] == "macro:economic_events_calendar")
+    assert cal_atom["freshness_status"] == "fresh"
+
+
+def test_markdown_dedup_setup_bridge_and_chronos_run_window():
+    cfg = load_judgment_config()
+    bundle = generate_demo_judgment_inputs()
+    cutoff = pd.Timestamp(bundle["cutoff_utc"]).to_pydatetime()
+    # Run timestamp +25m after closed-bar cutoff inside the same hour MUST remain fresh (not future_excluded!)
+    bundle["chronos_forecast"] = {
+        "weights_ran": True,
+        "model_id": "amazon/chronos-t5-tiny",
+        "revision": "29d808298f1a62493e7b9a5e08529d0d930fa189",
+        "run_at_utc": (cutoff + timedelta(minutes=25)).isoformat(),
+        "forecasts": {
+            sym: {
+                "ok": True,
+                "last_close_at_utc": cutoff.isoformat(),
+                "quantile_10": [float(bundle["market_snapshot"]["instruments"][sym]["candles_closed_1h"][-1]["close"]) * 0.99] * 24,
+                "quantile_50": [float(bundle["market_snapshot"]["instruments"][sym]["candles_closed_1h"][-1]["close"]) * 1.03] * 24,
+                "quantile_90": [float(bundle["market_snapshot"]["instruments"][sym]["candles_closed_1h"][-1]["close"]) * 1.06] * 24,
+            }
+            for sym in ("BTCUSDT", "XAUUSDT", "NDX100USDT")
+        },
+    }
+    frames_1h = validate_market_snapshot_coherence(bundle["market_snapshot"], cutoff_utc=cutoff)["frames_1h"]
+    fc_atoms, _ = build_forecast_and_model_evidence(
+        frames_1h=frames_1h,
+        chronos_payload=bundle["chronos_forecast"],
+        llm_opinion=None,
+        cutoff_utc=cutoff,
+        cfg=cfg,
+    )
+    btc_fc = next(a for a in fc_atoms if a["evidence_id"] == "forecast:btcusdt:chronos_neural")
+    assert btc_fc["freshness_status"] == "fresh"
+    assert validate_atom_temporal_bounds(btc_fc, cutoff_utc=cutoff)["freshness_status"] == "fresh"
+
+    pkt = synthesize_judgment_packet(bundle, starting_cash_usdt=100.0)
+    for sym in ("BTCUSDT", "XAUUSDT", "NDX100USDT"):
+        assert "setup_bridge" in pkt["judgments"][sym]
+        assert pkt["judgments"][sym]["setup_bridge"]["summary_cn"]
+
+    ans = answer_judgment_query("今天黄金、BTC、纳指 100 看多还是看空？", packet=pkt)
+    md = ans["markdown"]
+    assert "研究→开仓等待条件 (v2.2.1)" in md
+    assert "交易所微观结构盘口/资金费率" in md
+    for line in md.splitlines():
+        if line.startswith("- **关键依据**：") or line.startswith("- **最强反证**：") or line.startswith("- **失效与改判条件**："):
+            body = line.split("：", 1)[1]
+            parts = [p.strip() for p in body.split("; ") if p.strip()]
+            assert len(parts) == len(set(parts)), f"Duplicate entries in Markdown line: {line}"
+
+    why = answer_judgment_query("为什么不做多？", packet=pkt)
+    assert "距离 v2.2.1 正式触发条件" in why["markdown"]
+
+
+def test_intraday_yahoo_coinmetrics_status_time_and_venue_microstructure_gate():
+    from urllib.parse import unquote
+
+    cfg = load_judgment_config()
+    cutoff = datetime(2026, 11, 25, 10, 0, tzinfo=timezone.utc)
+    ts_list = [int((cutoff - timedelta(hours=h)).timestamp()) for h in range(48, -1, -1)] + [
+        int((cutoff + timedelta(hours=2)).timestamp()),  # Future bar MUST be stripped!
+    ]
+
+    def _yahoo_closes(start: float, step_last24: float, fut_val: float) -> list[float]:
+        arr = [start for _ in range(len(ts_list) - 1)]
+        for idx in range(len(arr) - 24, len(arr)):
+            arr[idx] = start + step_last24 * ((idx - (len(arr) - 25)) / 24.0)
+        arr.append(fut_val)
+        return arr
+
+    yahoo_map = {
+        "DX-Y.NYB": _yahoo_closes(102.0, +1.5, 90.0),
+        "^TNX": _yahoo_closes(41.5, +1.2, 30.0),  # +12 bps 24h (>6 bps threshold)
+        "TIP": _yahoo_closes(108.0, -0.5, 120.0),
+        "QQQ": _yahoo_closes(500.0, +2.0, 400.0),
+        "QQEW": _yahoo_closes(120.0, +3.0, 90.0),
+    }
+
+    def yahoo_handler(request: httpx.Request) -> httpx.Response:
+        sym = unquote(request.url.path.rsplit("/", 1)[-1])
+        return httpx.Response(
+            200,
+            json={
+                "chart": {
+                    "result": [
+                        {
+                            "timestamp": ts_list,
+                            "indicators": {"quote": [{"close": yahoo_map[sym]}]},
+                        }
+                    ]
+                }
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(yahoo_handler)) as y_cli:
+        im = fetch_yahoo_intraday_macro_and_breadth(bar_cutoff_utc=cutoff, client=y_cli)
+    assert im["ok"] is True
+    assert im["series"]["DX-Y.NYB"]["obs_at_utc"] == cutoff.isoformat()
+    assert im["series"]["DX-Y.NYB"]["close"] == 103.5
+    assert im["series"]["^TNX"]["close"] == 42.7
+    assert im["qqew_minus_qqq_5d_pct"] is not None
+
+    def cm_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "data": [
+                    {
+                        "time": "2026-11-24T00:00:00.000000000Z",
+                        "FlowInExNtv": "1000.0",
+                        "FlowInExNtv-status": "flash",
+                        "FlowInExNtv-status-time": (cutoff - timedelta(hours=2)).isoformat(),
+                        "FlowOutExNtv": "3500.0",
+                        "FlowOutExNtv-status": "flash",
+                        "FlowOutExNtv-status-time": (cutoff - timedelta(hours=1)).isoformat(),
+                        "FlowInExUSD": "90000000.0",
+                        "FlowOutExUSD": "315000000.0",
+                    },
+                    {
+                        # Future status-time MUST be rejected!
+                        "time": "2026-11-25T00:00:00.000000000Z",
+                        "FlowInExNtv": "9000.0",
+                        "FlowInExNtv-status": "flash",
+                        "FlowInExNtv-status-time": (cutoff + timedelta(hours=1)).isoformat(),
+                        "FlowOutExNtv": "1000.0",
+                        "FlowOutExNtv-status": "flash",
+                        "FlowOutExNtv-status-time": (cutoff + timedelta(hours=1)).isoformat(),
+                    },
+                ]
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(cm_handler)) as cm_cli:
+        ex_nf = fetch_coinmetrics_btc_exchange_flows(decision_cutoff_utc=cutoff, client=cm_cli)
+    assert ex_nf["usable"] is True
+    assert ex_nf["netflow_btc"] == -2500.0
+
+    macro_atoms, macro_sum = build_macro_evidence(
+        alfred_series={},
+        dxy_live={"ok": False, "reason": "no_ice"},
+        event_calendar=None,
+        verified_news=[],
+        vix_summary={},
+        cutoff_utc=cutoff,
+        cfg=cfg,
+        intraday_macro=im,
+    )
+    m_by_id = {a["evidence_id"]: a for a in macro_atoms}
+    assert m_by_id["macro:ice_dxy"]["freshness_status"] == "missing"
+    assert m_by_id["macro:real_yield_intraday"]["freshness_status"] == "missing"
+    assert m_by_id["macro:intraday_dollar_proxy:DX_Y_NYB"]["freshness_status"] == "fresh"
+    assert m_by_id["macro:intraday_dollar_proxy:DX_Y_NYB"]["direction_by_symbol"]["BTCUSDT"] == "bearish"
+    assert m_by_id["macro:intraday_rates_tips_proxy:TNX_TIP"]["freshness_status"] == "fresh"
+    assert macro_sum["ice_dxy_available"] is False
+    assert macro_sum["intraday_dollar_dx_y_nyb"] == 103.5
+    assert macro_sum["intraday_tnx_pct"] == 4.27
+    assert macro_sum["intraday_tnx_delta_24h_bps"] == 12.0
+
+    # Also verify direct percent-scale ^TNX quotes (e.g. 4.904% with +0.12 = +12 bps) normalize identically
+    from piia.intelligence.judgment.evidence import _normalize_tnx_yield
+    assert _normalize_tnx_yield({"ok": True, "close": 4.904, "delta_24h": 0.12}) == (4.904, 12.0)
+
+    bundle = generate_demo_judgment_inputs(now=cutoff)
+    sent_atoms, _, _ = build_sentiment_flow_evidence(
+        market_snapshot=bundle["market_snapshot"],
+        alfred_series={},
+        fear_greed_ctx=None,
+        etf_ctx=None,
+        gold_cot_ctx=None,
+        onchain_ctx=None,
+        exchange_netflow_ctx=ex_nf,
+        gold_etf_ctx=None,
+        ndx_edgar_filings=[],
+        polymarket_ctx=None,
+        cutoff_utc=cutoff,
+        cfg=cfg,
+        intraday_macro=im,
+    )
+    s_by_id = {a["evidence_id"]: a for a in sent_atoms}
+    assert s_by_id["sentiment:btc:onchain_exchange_netflow"]["freshness_status"] == "fresh"
+    assert s_by_id["sentiment:btc:onchain_exchange_netflow"]["direction_by_symbol"]["BTCUSDT"] == "bullish"
+    assert s_by_id["sentiment:btc:onchain_network_activity"]["freshness_status"] == "missing"
+    assert s_by_id["sentiment:ndx:tech_relative_strength"]["value_summary"]["qqew_minus_qqq_5d_pct"] == im["qqew_minus_qqq_5d_pct"]
+
+    # Bitget venue microstructure: XAUUSDT 4h default is normal; BTCUSDT mark/last dislocation >= 50 bps triggers pending_review
+    def bg_handler(request: httpx.Request) -> httpx.Response:
+        url = str(request.url)
+        if "tickers" in url:
+            return httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"symbol": "BTCUSDT", "lastPr": "100000", "markPrice": "100650", "indexPrice": "100100"},
+                        {"symbol": "XAUUSDT", "lastPr": "2650", "markPrice": "2651", "indexPrice": "2650.5"},
+                        {"symbol": "NDX100USDT", "lastPr": "21000", "markPrice": "21002", "indexPrice": "21001"},
+                    ]
+                },
+            )
+        sym = dict(request.url.params).get("symbol")
+        intervals = {"BTCUSDT": "2", "XAUUSDT": "4", "NDX100USDT": "8"}
+        return httpx.Response(200, json={"data": [{"symbol": sym, "fundingRate": "0.0001", "fundingRateInterval": intervals[sym], "nextUpdate": "1795651200000"}]})
+
+    with httpx.Client(transport=httpx.MockTransport(bg_handler)) as bg_cli:
+        vm = fetch_bitget_venue_microstructure(("BTCUSDT", "XAUUSDT", "NDX100USDT"), decision_cutoff_utc=cutoff, client=bg_cli)
+    assert vm["ok"] is True
+
+    xau_audit = _audit_venue_microstructure("XAUUSDT", venue_micro=vm, cfg=cfg)
+    assert xau_audit["dynamic_interval_changed"] is False
+    assert xau_audit["review_triggers"] == []
+
+    btc_audit = _audit_venue_microstructure("BTCUSDT", venue_micro=vm, cfg=cfg)
+    assert btc_audit["severe_dislocation"] is True
+    assert btc_audit["dynamic_interval_changed"] is True
+    v2_cand = {
+        "official_v2_2_1_signal": "long",
+        "setup_type": "trend_pullback",
+        "paper_eligibility": {"eligible": True, "status": "eligible", "label_cn": "是", "review_required": False, "review_triggers": [], "side": "long", "blocking_reasons": []},
+    }
+    pe_gated, trigs = _apply_v3_paper_review_gate(
+        "BTCUSDT",
+        v2_ctrl=v2_cand,
+        pos={"close": 100000.0, "metrics": {}, "invalidation_levels": {}},
+        atoms=[],
+        news_enabled=True,
+        venue_audit=btc_audit,
+    )
+    assert pe_gated["status"] == "pending_review"
+    assert pe_gated["eligible"] is False
+    assert any("venue_mark_last_dislocation" == t["trigger"] for t in trigs)
+    assert any("venue_dynamic_funding_interval_changed" == t["trigger"] for t in trigs)
+
+
+def test_archived_5_domain_bundles_append_only_replay_cli_and_api(tmp_path, monkeypatch):
+    from piia.intelligence.api import app
+    from piia.intelligence.cli import main as piia_main
+
+    arch_db = tmp_path / "arch_replay.sqlite"
+    for h in (0, 1):
+        b = generate_demo_judgment_inputs(step_shift_hours=h)
+        b["is_synthetic_demo"] = False
+        b["intraday_macro"] = {"ok": True, "retrieved_at_utc": b["cutoff_utc"], "series": {}, "qqew_minus_qqq_5d_pct": 0.9}
+        b["exchange_netflow"] = {"usable": False, "reason": "none_in_fixture"}
+        b["venue_microstructure"] = {"ok": True, "symbols": {"XAUUSDT": {"funding_interval_hours": 4, "mark_vs_last_bps": 1.0}}}
+        res = record_judgment_cycle(b, db_path=arch_db, starting_cash=100.0)
+        assert res["archived_bundle_sha256"]
+
+    # Calling again for hour 0 stays idempotent and append-only triggers protect archived_input_bundles
+    b0_again = generate_demo_judgment_inputs(step_shift_hours=0)
+    b0_again["is_synthetic_demo"] = False
+    res_dup = record_judgment_cycle(b0_again, db_path=arch_db, starting_cash=100.0)
+    assert res_dup["status"] == "already_recorded_for_hour"
+
+    conn = sqlite3.connect(arch_db)
+    try:
+        cnt = conn.execute("SELECT COUNT(*) FROM archived_input_bundles").fetchone()[0]
+        assert cnt == 2
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("UPDATE archived_input_bundles SET bundle_sha256='tamper'")
+        with pytest.raises(sqlite3.DatabaseError):
+            conn.execute("DELETE FROM archived_input_bundles")
+    finally:
+        conn.close()
+
+    rep = replay_archived_judgment_ledger(arch_db, starting_cash=100.0)
+    assert rep["status"] == "replayed_archived_5_domain_bundles"
+    assert rep["replay_non_blind_5_domains"] is True
+    assert rep["archived_bundles_count"] == 2
+    assert rep["starting_cash_usdt"] == 100.0
+    assert "domain_ablation" in rep
+
+    cli_db = tmp_path / "cli_arch.sqlite"
+    cli_out = tmp_path / "cli_rep.json"
+    assert piia_main(["judgment-capture-hourly", "--demo", "--starting-cash", "100", "--db", str(cli_db)]) == 0
+    assert piia_main(["judgment-replay-archived", "--demo", "--starting-cash", "100", "--db", str(cli_db), "--out", str(cli_out)]) == 0
+    assert json.loads(cli_out.read_text(encoding="utf-8"))["archived_bundles_count"] == 1
+
+    monkeypatch.setenv("PIIA_JUDGMENT_V3_DEMO_LEDGER_PATH", str(cli_db))
+    monkeypatch.setenv("PIIA_DATABASE_URL", f"sqlite:///{(tmp_path / 'api_arch.sqlite').as_posix()}")
+    with TestClient(app) as client:
+        r = client.get("/judgment-v3/replay-archived", params={"demo": "true", "starting_cash": 100})
+        assert r.status_code == 200
+        assert r.json()["archived_bundles_count"] == 1
 

@@ -12,6 +12,7 @@ import math
 from typing import Any
 
 from piia.intelligence.agent_v2.pillars import (
+    DEFAULT_FUNDING_INTERVAL_HOURS,
     SYMBOLS,
     build_bar_evidence_for_symbol,
     canonical_sha256,
@@ -255,6 +256,7 @@ def _apply_v3_paper_review_gate(
     pos: dict[str, Any],
     atoms: list[dict[str, Any]],
     news_enabled: bool,
+    venue_audit: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, str]]]:
     """Screen counter-trend v2 signals against shock structural breakouts and opposing primary news."""
     pe = dict(v2_ctrl["paper_eligibility"])
@@ -316,6 +318,9 @@ def _apply_v3_paper_review_gate(
                     }
                 )
 
+    if venue_audit and venue_audit.get("review_triggers"):
+        triggers.extend(venue_audit["review_triggers"])
+
     if triggers:
         trig_ids = [t["trigger"] for t in triggers]
         pe["eligible"] = False
@@ -327,6 +332,200 @@ def _apply_v3_paper_review_gate(
         pe["side"] = None
         pe["blocking_reasons"] = [f"pending_review:{','.join(trig_ids)}"]
     return pe, triggers
+
+
+def _audit_venue_microstructure(
+    sym: str,
+    *,
+    venue_micro: dict[str, Any] | None,
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Audit live mark/last/index dispersion and dynamic funding-interval shifts."""
+    vcfg = cfg.get("venue_microstructure") or {}
+    warn_bps = float(vcfg.get("mark_last_warn_bps", 25.0))
+    gate_bps = float(vcfg.get("mark_last_gate_bps", 50.0))
+    expected_h = int(DEFAULT_FUNDING_INTERVAL_HOURS.get(sym, 8))
+    sym_data = ((venue_micro or {}).get("symbols") or {}).get(sym) or {}
+    if not sym_data:
+        return {
+            "available": False,
+            "mark_vs_last_bps": None,
+            "mark_vs_index_bps": None,
+            "funding_interval_hours": None,
+            "expected_funding_interval_hours": expected_h,
+            "dynamic_interval_changed": False,
+            "elevated_dislocation": False,
+            "severe_dislocation": False,
+            "review_triggers": [],
+            "summary_cn": "未采集交易所实时 mark/last/funding_interval（历史/合成快照或接口缺失）",
+        }
+    ml_bps = _safe_f(sym_data.get("mark_vs_last_bps"))
+    mi_bps = _safe_f(sym_data.get("mark_vs_index_bps"))
+    int_h_raw = sym_data.get("funding_interval_hours")
+    try:
+        int_h = int(int_h_raw) if int_h_raw is not None else None
+    except (TypeError, ValueError):
+        int_h = None
+    dyn_chg = int_h is not None and int_h != expected_h
+    sev_disloc = ml_bps is not None and abs(ml_bps) >= gate_bps
+    elev_disloc = ml_bps is not None and abs(ml_bps) >= warn_bps
+    rev: list[dict[str, str]] = []
+    if sev_disloc:
+        rev.append(
+            {
+                "trigger": "venue_mark_last_dislocation",
+                "detail": f"{sym} mark/last 偏离 {ml_bps:+.2f} bps (|偏离|>={gate_bps:.0f} bps 阈值)",
+            }
+        )
+    if dyn_chg:
+        rev.append(
+            {
+                "trigger": "venue_dynamic_funding_interval_changed",
+                "detail": f"{sym} Bitget 资金费周期从默认 {expected_h}h 调整为 {int_h}h",
+            }
+        )
+    ml_txt = f"{ml_bps:+.2f} bps" if ml_bps is not None else "N/A"
+    mi_txt = f"{mi_bps:+.2f} bps" if mi_bps is not None else "N/A"
+    int_txt = f"{int_h}h(默认{expected_h}h)" if int_h is not None else "N/A"
+    status_tag = "异常待复核" if rev else ("轻度基差偏离警戒" if elev_disloc else "正常")
+    return {
+        "available": True,
+        "last_price": _safe_f(sym_data.get("last_price")),
+        "mark_price": _safe_f(sym_data.get("mark_price")),
+        "index_price": _safe_f(sym_data.get("index_price")),
+        "mark_vs_last_bps": ml_bps,
+        "mark_vs_index_bps": mi_bps,
+        "funding_rate": _safe_f(sym_data.get("funding_rate")),
+        "funding_interval_hours": int_h,
+        "expected_funding_interval_hours": expected_h,
+        "next_funding_utc": sym_data.get("next_funding_utc"),
+        "dynamic_interval_changed": dyn_chg,
+        "elevated_dislocation": elev_disloc,
+        "severe_dislocation": sev_disloc,
+        "review_triggers": rev,
+        "summary_cn": f"{status_tag}: mark-last={ml_txt}, mark-index={mi_txt}, 结算周期={int_txt}",
+    }
+
+
+def _build_setup_distance_bridge(
+    sym: str,
+    *,
+    pos: dict[str, Any],
+    prep_df: Any,
+    v2_ctrl: dict[str, Any],
+) -> dict[str, Any]:
+    """Quantify exact numerical distance between current state and frozen v2.2.1 entry triggers."""
+    v2_cfg = load_v2_config()
+    mcfg = v2_cfg["evidence_pillars"]["market"]
+    m_pos = pos.get("metrics") or {}
+    lvl = pos.get("invalidation_levels") or {}
+    close_px = _safe_f(pos.get("close"))
+    adx14 = _safe_f(m_pos.get("adx14"))
+    rsi14 = _safe_f(m_pos.get("rsi14"))
+    atr_ratio = _safe_f(m_pos.get("atr_ratio"))
+
+    don_hi = _safe_f(lvl.get("donchian_48h_high"))
+    don_lo = _safe_f(lvl.get("donchian_48h_low"))
+    bb_up = _safe_f(lvl.get("bb_upper"))
+    bb_lo = _safe_f(lvl.get("bb_lower"))
+    e20 = _safe_f(m_pos.get("h1_ema20"))
+    low_px = None
+    high_px = None
+    pdi = None
+    mdi = None
+    if prep_df is not None and len(prep_df) >= 1:
+        r = prep_df.iloc[-1]
+        close_px = close_px or _safe_f(r.get("close"))
+        low_px = _safe_f(r.get("low"))
+        high_px = _safe_f(r.get("high"))
+        pdi = _safe_f(r.get("plus_di14"))
+        mdi = _safe_f(r.get("minus_di14"))
+        don_hi = _safe_f(r.get("donchian_high")) or don_hi
+        don_lo = _safe_f(r.get("donchian_low")) or don_lo
+        bb_up = _safe_f(r.get("bb_upper")) or bb_up
+        bb_lo = _safe_f(r.get("bb_lower")) or bb_lo
+        e20 = _safe_f(r.get("ema20")) or e20
+
+    adx_rmax = float(mcfg["adx_range_max"])
+    adx_tmin = float(mcfg["adx_trend_min"])
+    adx_pmin = float(mcfg["adx_pullback_min"])
+    ext_vol = float(mcfg["extreme_vol_atr_ratio"])
+    rng_max_vol = float(mcfg["range_max_atr_ratio"])
+    rsi_os = float(mcfg["rsi_oversold"])
+    rsi_ob = float(mcfg["rsi_overbought"])
+
+    gaps: list[str] = []
+    if v2_ctrl["official_v2_2_1_signal"] in {"long", "short"}:
+        summary_cn = f"已触发 {v2_ctrl.get('setup_type')} ({v2_ctrl['official_v2_2_1_signal']})"
+        return {
+            "symbol": sym,
+            "v2_signal": v2_ctrl["official_v2_2_1_signal"],
+            "setup_type": v2_ctrl.get("setup_type"),
+            "blocking_gaps": [],
+            "metrics_snapshot": {"adx14": adx14, "rsi14": rsi14, "atr_ratio": atr_ratio},
+            "summary_cn": summary_cn,
+        }
+
+    h1_dir, h4_dir = pos.get("h1_dir"), pos.get("h4_dir")
+    aligned_dir = h1_dir == h4_dir and h1_dir in {"up", "down"}
+    if not aligned_dir:
+        gaps.append(f"1H({h1_dir}) 与 4H({h4_dir}) EMA20/50 尚未同向对齐")
+    if adx14 is not None:
+        if adx_rmax <= adx14 < adx_tmin:
+            gaps.append(f"ADX14={adx14:.1f} 处于灰色区间 [{adx_rmax:.0f},{adx_tmin:.0f})（距趋势触发差 {adx_tmin - adx14:.1f}，距震荡反转差 {adx14 - adx_rmax:.1f}）")
+        elif adx14 < adx_rmax:
+            gaps.append(f"震荡模式 (ADX14={adx14:.1f}<{adx_rmax:.0f})：需等 RSI 极值(<{rsi_os:.0f} 或 >{rsi_ob:.0f}) 且收盘触及布林上下轨")
+        elif adx14 < adx_pmin:
+            gaps.append(f"趋势回踩还需 ADX14>={adx_pmin:.0f} (当前 {adx14:.1f}，差 {adx_pmin - adx14:.1f})")
+    if pdi is not None and mdi is not None and h1_dir in {"up", "down"}:
+        if h1_dir == "up" and pdi <= mdi:
+            gaps.append(f"+DI({pdi:.1f}) <= -DI({mdi:.1f})，多头方向动量未确认")
+        elif h1_dir == "down" and mdi <= pdi:
+            gaps.append(f"-DI({mdi:.1f}) <= +DI({pdi:.1f})，空头方向动量未确认")
+    if atr_ratio is not None and atr_ratio >= ext_vol:
+        gaps.append(f"ATR比={atr_ratio:.2f} >= {ext_vol:.1f} 触发极端波动停开门槛")
+    elif atr_ratio is not None and atr_ratio > rng_max_vol and adx14 is not None and adx14 < adx_rmax:
+        gaps.append(f"震荡波动过高 (ATR比={atr_ratio:.2f} > {rng_max_vol:.1f})")
+
+    pct_to_don_hi = ((don_hi - close_px) / close_px * 100.0) if (don_hi and close_px and close_px > 0) else None
+    pct_to_don_lo = ((close_px - don_lo) / close_px * 100.0) if (don_lo and close_px and close_px > 0) else None
+    pct_to_ema20 = ((close_px - e20) / close_px * 100.0) if (e20 and close_px and close_px > 0) else None
+
+    if aligned_dir and h1_dir == "up" and don_hi is not None and close_px is not None:
+        ema_part = (
+            f"，或低点回踩 1H EMA20 ({e20:.2f}, 当前距 {pct_to_ema20:+.2f}%) 且 RSI14<=56 (当前 {rsi14:.1f})"
+            if (e20 is not None and pct_to_ema20 is not None and rsi14 is not None)
+            else ""
+        )
+        gaps.append(f"向上突破需收于 48h 上轨 {don_hi:.2f} 上方 (当前差 {pct_to_don_hi:+.2f}%){ema_part}")
+    elif aligned_dir and h1_dir == "down" and don_lo is not None and close_px is not None:
+        ema_part = (
+            f"，或反弹碰 1H EMA20 ({e20:.2f}, 当前距 {pct_to_ema20:+.2f}%) 且 RSI14>=44 (当前 {rsi14:.1f})"
+            if (e20 is not None and pct_to_ema20 is not None and rsi14 is not None)
+            else ""
+        )
+        gaps.append(f"向下破位需收于 48h 下轨 {don_lo:.2f} 下方 (当前差 {pct_to_don_lo:+.2f}%){ema_part}")
+    elif bb_lo is not None and bb_up is not None and close_px is not None and rsi14 is not None:
+        gaps.append(f"布林带区间 [{bb_lo:.2f}, {bb_up:.2f}] 内运行，当前收盘 {close_px:.2f} / RSI14={rsi14:.1f}")
+
+    return {
+        "symbol": sym,
+        "v2_signal": v2_ctrl["official_v2_2_1_signal"],
+        "stand_aside_reason": v2_ctrl.get("stand_aside_reason"),
+        "blocking_gaps": gaps,
+        "metrics_snapshot": {
+            "close": close_px,
+            "adx14": round(adx14, 2) if adx14 is not None else None,
+            "rsi14": round(rsi14, 2) if rsi14 is not None else None,
+            "atr_ratio": round(atr_ratio, 3) if atr_ratio is not None else None,
+            "pct_to_donchian_high": round(pct_to_don_hi, 3) if pct_to_don_hi is not None else None,
+            "pct_to_donchian_low": round(pct_to_don_lo, 3) if pct_to_don_lo is not None else None,
+            "pct_from_1h_ema20": round(pct_to_ema20, 3) if pct_to_ema20 is not None else None,
+            "plus_di14": round(pdi, 2) if pdi is not None else None,
+            "minus_di14": round(mdi, 2) if mdi is not None else None,
+        },
+        "summary_cn": "；".join(gaps[:3]) if gaps else f"等待形态触发 ({v2_ctrl.get('stand_aside_reason')})",
+    }
 
 
 def _build_factor_usage_ledger(
@@ -602,7 +801,11 @@ def _synthesize_one(
         weight = 0
         if dom == "macro" and horizon == "swing_1_3d" and not ablation["enable_tide"]:
             weight = 1 if d == "bullish" else (-1 if d == "bearish" else 0)
-        elif dom == "macro" and atom["evidence_id"] == "macro:ice_dxy" and d in {"bullish", "bearish"}:
+        elif dom == "macro" and atom["evidence_id"] in {
+            "macro:ice_dxy",
+            "macro:intraday_dollar_proxy:DX_Y_NYB",
+            "macro:intraday_rates_tips_proxy:TNX_TIP",
+        } and d in {"bullish", "bearish"}:
             weight = 1 if d == "bullish" else -1
         elif dom == "news" and (atom["value_summary"] or {}).get("news_kind") == "primary_release":
             age_h = _safe_f((atom["value_summary"] or {}).get("age_hours"))
@@ -759,10 +962,10 @@ def _synthesize_one(
         "hard_gates_triggered": hard_gates,
         "external_net_score_dedup": ext_score,
         "active_causal_drivers": [{"group": g, "vote": v[0], "summary": v[1], "domain": v[2]} for g, v in driver_votes.items()],
-        "supporting_evidence": supporting[:6] or [tech["rationale"]],
-        "strongest_counterevidence": counter[:5] or ["当前未发现足以直接否决结论的已核验强反证（仍受未校准概率与缺失数据限制）"],
-        "invalidation_conditions": invalidation_list,
-        "flip_conditions": flip_list,
+        "supporting_evidence": list(dict.fromkeys(supporting))[:6] or [tech["rationale"]],
+        "strongest_counterevidence": list(dict.fromkeys(counter))[:5] or ["当前未发现足以直接否决结论的已核验强反证（仍受未校准概率与缺失数据限制）"],
+        "invalidation_conditions": list(dict.fromkeys(invalidation_list)),
+        "flip_conditions": list(dict.fromkeys(flip_list)),
         "data_gaps": sorted(set(gaps)),
     }
 
@@ -834,6 +1037,7 @@ def synthesize_judgment_packet(
         polymarket_ctx=inputs_bundle.get("polymarket") if sw["enable_sentiment_flow"] else None,
         cutoff_utc=decision_cutoff_dt,
         cfg=cfg,
+        intraday_macro=inputs_bundle.get("intraday_macro") if sw["enable_sentiment_flow"] else None,
         replay_mode=is_replay,
     )
     macro_atoms, macro_summary = build_macro_evidence(
@@ -844,6 +1048,9 @@ def synthesize_judgment_packet(
         vix_summary=vix_summary,
         cutoff_utc=decision_cutoff_dt,
         cfg=cfg,
+        intraday_macro=inputs_bundle.get("intraday_macro") if sw["enable_macro"] else None,
+        frames_1h=coherence["frames_1h"],
+        replay_mode=is_replay,
     )
     tide, prepared_1h = compute_market_tide(
         frames_1h=coherence["frames_1h"],
@@ -942,13 +1149,25 @@ def synthesize_judgment_packet(
                 "paper_eligibility": {"eligible": False, "status": "blocked", "label_cn": "否", "review_required": False, "review_triggers": [], "side": None, "blocking_reasons": list(coherence["reasons"])},
             }
         )
+        venue_audit = _audit_venue_microstructure(
+            sym,
+            venue_micro=inputs_bundle.get("venue_microstructure"),
+            cfg=cfg,
+        )
         v3_pe, review_triggers = _apply_v3_paper_review_gate(
             sym,
             v2_ctrl=v2_ctrl,
             pos=pos,
             atoms=all_atoms,
             news_enabled=sw["enable_news"],
+            venue_audit=venue_audit,
         ) if coherence["aligned"] else (v2_ctrl["paper_eligibility"], [])
+        setup_bridge = _build_setup_distance_bridge(
+            sym,
+            pos=pos,
+            prep_df=prepared_1h.get(sym),
+            v2_ctrl=v2_ctrl,
+        )
 
         changed_evidence_items: list[dict[str, Any]] = []
         for h in HORIZONS:
@@ -973,6 +1192,8 @@ def synthesize_judgment_packet(
             "official_v2_2_1_disagreements": v2_ctrl["disagreements"],
             "official_v2_2_1_paper_eligibility": v2_ctrl["paper_eligibility"],
             "paper_eligibility": v3_pe,
+            "setup_bridge": setup_bridge,
+            "venue_microstructure_audit": venue_audit,
             "agent_or_human_supplement": supp_block,
         }
 
@@ -1030,6 +1251,7 @@ def synthesize_judgment_packet(
         "ablation_switches": sw,
         "macro_summary": macro_summary,
         "sentiment_summary": sent_summary,
+        "venue_microstructure": inputs_bundle.get("venue_microstructure"),
         "tide": tide,
         "forecast_and_models": forecast_summary,
         "news_audit": verified_news,

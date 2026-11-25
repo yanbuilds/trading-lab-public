@@ -16,6 +16,7 @@ import io
 import json
 import math
 from pathlib import Path
+import tempfile
 from typing import Any
 from urllib.parse import urlencode
 
@@ -36,6 +37,9 @@ ROOT = Path(__file__).resolve().parents[4]
 DEFAULT_JUDGMENT_CONFIG_PATH = ROOT / "config" / "piia_judgment_v3.yaml"
 ALFRED_BASE = "https://alfred.stlouisfed.org/graph/alfredgraph.csv"
 STOOQ_DX_URL = "https://stooq.com/q/l/?s=dx.f&f=sd2t2ohlcv&h&e=csv"
+YAHOO_CHART_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
+COINMETRICS_EXFLOW_URL = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
+BITGET_MIX_BASE = "https://api.bitget.com/api/v2/mix/market"
 
 DATA_TIERS = (
     "realtime_verified",
@@ -486,12 +490,336 @@ def explain_macro_divergence_gold_vs_ndx(macro_summary: dict[str, Any], vix_summ
     return " ".join(parts)
 
 
+def fetch_yahoo_intraday_macro_and_breadth(
+    *,
+    bar_cutoff_utc: datetime,
+    timeout: float = 8.0,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Fetch public 1h delayed/intraday macro & breadth proxies strictly sliced <= bar_cutoff_utc."""
+    from urllib.parse import quote as _url_quote
+
+    cutoff_utc = bar_cutoff_utc.astimezone(timezone.utc)
+    tickers = ("DX-Y.NYB", "^TNX", "TIP", "QQQ", "QQEW")
+    own = client is None
+    client = client or httpx.Client(
+        timeout=timeout,
+        follow_redirects=True,
+        headers={"User-Agent": "Mozilla/5.0 TradingLabResearch/3.2"},
+    )
+    series_out: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    try:
+        for sym in tickers:
+            url = f"{YAHOO_CHART_BASE}/{_url_quote(sym)}?interval=1h&range=5d"
+            try:
+                resp = client.get(url)
+                resp.raise_for_status()
+                raw = resp.content
+                payload = resp.json()
+                res = ((payload.get("chart") or {}).get("result") or [None])[0]
+                if not isinstance(res, dict):
+                    errors[sym] = "empty_chart_result"
+                    continue
+                ts_list = res.get("timestamp") or []
+                closes = (((res.get("indicators") or {}).get("quote") or [{}])[0] or {}).get("close") or []
+                pts: list[tuple[datetime, float]] = []
+                for ts_val, cl_val in zip(ts_list, closes):
+                    if ts_val is None or cl_val is None:
+                        continue
+                    try:
+                        c_f = float(cl_val)
+                        t_dt = datetime.fromtimestamp(int(ts_val), tz=timezone.utc)
+                    except (TypeError, ValueError, OSError):
+                        continue
+                    if math.isfinite(c_f) and t_dt <= cutoff_utc:
+                        pts.append((t_dt, c_f))
+                pts.sort(key=lambda x: x[0])
+                if not pts:
+                    errors[sym] = "no_bars_le_cutoff"
+                    continue
+                last_dt, last_px = pts[-1]
+                target_24h = last_dt - timedelta(hours=24)
+                ref_24h = min(pts, key=lambda x: abs((x[0] - target_24h).total_seconds()))
+                px_24h = ref_24h[1] if len(pts) >= 2 and ref_24h[0] < last_dt - timedelta(hours=6) else None
+                first_dt, first_px = pts[0]
+                pct_24h = ((last_px / px_24h - 1.0) * 100.0) if (px_24h is not None and px_24h > 0) else None
+                pct_5d = ((last_px / first_px - 1.0) * 100.0) if (first_px > 0 and (last_dt - first_dt).total_seconds() >= 24 * 3600) else None
+                delta_24h = (last_px - px_24h) if px_24h is not None else None
+                series_out[sym] = {
+                    "ok": True,
+                    "symbol": sym,
+                    "close": round(last_px, 6),
+                    "obs_at_utc": last_dt.isoformat(),
+                    "bars_count": len(pts),
+                    "pct_24h": round(pct_24h, 4) if pct_24h is not None else None,
+                    "pct_5d": round(pct_5d, 4) if pct_5d is not None else None,
+                    "delta_24h": round(delta_24h, 6) if delta_24h is not None else None,
+                    "source_url": url,
+                    "raw_sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            except Exception as exc:
+                errors[sym] = type(exc).__name__
+    finally:
+        if own:
+            client.close()
+
+    qqew = series_out.get("QQEW") or {}
+    qqq = series_out.get("QQQ") or {}
+    qqew_minus_qqq_5d = (
+        round(float(qqew["pct_5d"]) - float(qqq["pct_5d"]), 4)
+        if (qqew.get("ok") and qqq.get("ok") and qqew.get("pct_5d") is not None and qqq.get("pct_5d") is not None)
+        else None
+    )
+    qqew_minus_qqq_24h = (
+        round(float(qqew["pct_24h"]) - float(qqq["pct_24h"]), 4)
+        if (qqew.get("ok") and qqq.get("ok") and qqew.get("pct_24h") is not None and qqq.get("pct_24h") is not None)
+        else None
+    )
+    return {
+        "ok": bool(series_out),
+        "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "bar_cutoff_utc": cutoff_utc.isoformat(),
+        "series": series_out,
+        "qqew_minus_qqq_5d_pct": qqew_minus_qqq_5d,
+        "qqew_minus_qqq_24h_pct": qqew_minus_qqq_24h,
+        "errors": errors,
+    }
+
+
+def fetch_coinmetrics_btc_exchange_flows(
+    *,
+    decision_cutoff_utc: datetime,
+    timeout: float = 8.0,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Fetch public CoinMetrics BTC exchange inflows/outflows strictly gated by status-time <= cutoff."""
+    cutoff_utc = decision_cutoff_utc.astimezone(timezone.utc)
+    params = "assets=btc&metrics=FlowInExNtv,FlowOutExNtv,FlowInExUSD,FlowOutExUSD&page_size=10"
+    url = f"{COINMETRICS_EXFLOW_URL}?{params}"
+    own = client is None
+    client = client or httpx.Client(timeout=timeout, follow_redirects=True, headers={"User-Agent": "TradingLabResearch/3.2"})
+    try:
+        resp = client.get(url)
+        resp.raise_for_status()
+        raw = resp.content
+        raw_sha = hashlib.sha256(raw).hexdigest()
+        payload = resp.json()
+        eligible: list[tuple[datetime, datetime, dict[str, Any]]] = []
+        for row in payload.get("data") or []:
+            if not isinstance(row, dict):
+                continue
+            t_dt = _ts_utc(row.get("time"))
+            in_st = _ts_utc(row.get("FlowInExNtv-status-time"))
+            out_st = _ts_utc(row.get("FlowOutExNtv-status-time"))
+            if t_dt is None or in_st is None or out_st is None:
+                continue
+            avail_dt = max(in_st, out_st)
+            if t_dt <= cutoff_utc and avail_dt <= cutoff_utc:
+                try:
+                    float(row["FlowInExNtv"])
+                    float(row["FlowOutExNtv"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                eligible.append((t_dt, avail_dt, row))
+        if not eligible:
+            return {"usable": False, "reason": "no_point_in_time_verified_row", "source_url": url, "raw_sha256": raw_sha}
+        eligible.sort(key=lambda x: x[0])
+        t_dt, avail_dt, row = eligible[-1]
+        in_btc = float(row["FlowInExNtv"])
+        out_btc = float(row["FlowOutExNtv"])
+        net_btc = in_btc - out_btc
+        net_usd_musd = None
+        if row.get("FlowInExUSD") is not None and row.get("FlowOutExUSD") is not None:
+            try:
+                net_usd_musd = round((float(row["FlowInExUSD"]) - float(row["FlowOutExUSD"])) / 1e6, 3)
+            except (TypeError, ValueError):
+                pass
+        return {
+            "usable": True,
+            "source_name": "CoinMetrics Community API",
+            "source_url": url,
+            "raw_sha256": raw_sha,
+            "observed_at_utc": t_dt.isoformat(),
+            "available_at_utc": avail_dt.isoformat(),
+            "flow_in_btc": round(in_btc, 4),
+            "flow_out_btc": round(out_btc, 4),
+            "netflow_btc": round(net_btc, 4),
+            "netflow_usd_musd": net_usd_musd,
+            "metric_status": str(row.get("FlowInExNtv-status") or "flash"),
+        }
+    except Exception as exc:
+        return {"usable": False, "reason": type(exc).__name__, "source_url": url}
+    finally:
+        if own:
+            client.close()
+
+
+def fetch_bitget_venue_microstructure(
+    symbols: tuple[str, ...] = SYMBOLS,
+    *,
+    decision_cutoff_utc: datetime,
+    timeout: float = 8.0,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Fetch live Bitget mark/last/index prices and current funding interval schedule."""
+    own = client is None
+    client = client or httpx.Client(timeout=timeout, follow_redirects=True, headers={"User-Agent": "TradingLabResearch/3.2"})
+    out_syms: dict[str, Any] = {}
+    errors: dict[str, str] = {}
+    try:
+        ticker_map: dict[str, dict[str, Any]] = {}
+        try:
+            r_all = client.get(f"{BITGET_MIX_BASE}/tickers?productType=USDT-FUTURES")
+            r_all.raise_for_status()
+            for row in (r_all.json().get("data") or []):
+                if row.get("symbol") in symbols:
+                    ticker_map[str(row["symbol"])] = row
+        except Exception as exc:
+            errors["tickers"] = type(exc).__name__
+
+        for sym in symbols:
+            frow: dict[str, Any] = {}
+            try:
+                r_fr = client.get(f"{BITGET_MIX_BASE}/current-fund-rate?productType=USDT-FUTURES&symbol={sym}")
+                r_fr.raise_for_status()
+                d_list = r_fr.json().get("data") or []
+                if d_list:
+                    frow = d_list[0]
+            except Exception as exc:
+                errors[f"fund_rate:{sym}"] = type(exc).__name__
+
+            trow = ticker_map.get(sym) or {}
+            try:
+                last_p = float(trow["lastPr"]) if trow.get("lastPr") is not None else None
+                mark_p = float(trow["markPrice"]) if trow.get("markPrice") is not None else None
+                idx_p = float(trow["indexPrice"]) if trow.get("indexPrice") is not None else None
+            except (TypeError, ValueError):
+                last_p = mark_p = idx_p = None
+            mark_vs_last_bps = ((mark_p - last_p) / last_p * 10000.0) if (mark_p and last_p and last_p > 0) else None
+            mark_vs_idx_bps = ((mark_p - idx_p) / idx_p * 10000.0) if (mark_p and idx_p and idx_p > 0) else None
+            interval_h = None
+            if frow.get("fundingRateInterval") is not None:
+                try:
+                    interval_h = int(frow["fundingRateInterval"])
+                except (TypeError, ValueError):
+                    interval_h = None
+            next_upd_iso = None
+            if frow.get("nextUpdate"):
+                try:
+                    next_upd_iso = datetime.fromtimestamp(int(frow["nextUpdate"]) / 1000.0, tz=timezone.utc).isoformat()
+                except (TypeError, ValueError, OSError):
+                    next_upd_iso = None
+            out_syms[sym] = {
+                "last_price": last_p,
+                "mark_price": mark_p,
+                "index_price": idx_p,
+                "mark_vs_last_bps": round(mark_vs_last_bps, 2) if mark_vs_last_bps is not None else None,
+                "mark_vs_index_bps": round(mark_vs_idx_bps, 2) if mark_vs_idx_bps is not None else None,
+                "funding_rate": float(frow["fundingRate"]) if frow.get("fundingRate") is not None else None,
+                "funding_interval_hours": interval_h,
+                "next_funding_utc": next_upd_iso,
+                "min_funding_rate": frow.get("minFundingRate"),
+                "max_funding_rate": frow.get("maxFundingRate"),
+            }
+    finally:
+        if own:
+            client.close()
+    return {
+        "ok": any((v.get("mark_price") is not None or v.get("funding_interval_hours") is not None) for v in out_syms.values()),
+        "retrieved_at_utc": datetime.now(timezone.utc).isoformat(),
+        "decision_cutoff_utc": decision_cutoff_utc.isoformat(),
+        "symbols": out_syms,
+        "errors": errors,
+    }
+
+
+_CALENDAR_STOPWORDS = frozenset({
+    "and", "the", "for", "from", "with", "of", "in", "on", "to", "by", "at",
+    "release", "releases", "report", "second", "third", "first", "advance",
+    "preliminary", "estimate", "quarter", "annual", "monthly", "weekly",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december", "economic", "projections",
+    "press", "board", "bureau", "department", "news", "schedule",
+})
+
+
+def _agency_matches_news_item(agency: str, item: dict[str, Any]) -> bool:
+    ag = agency.lower().strip()
+    url = str(item.get("url") or "").lower()
+    src = str(item.get("source_name") or "").lower()
+    if "bea" in ag:
+        return ("bea.gov" in url) or ("bea" in src) or ("bureau of economic analysis" in src)
+    if "bls" in ag:
+        return ("bls.gov" in url) or ("bls" in src) or ("labor statistics" in src)
+    if "fed" in ag:
+        return ("federalreserve.gov" in url) or ("federal reserve" in src)
+    return True
+
+
+def _post_release_reaction_proxy(
+    sched_dt: datetime,
+    *,
+    cutoff_utc: datetime,
+    frames_1h: dict[str, pd.DataFrame] | None,
+) -> dict[str, Any] | None:
+    """Measure observed 0-6h post-release price impulse when official feed lacks consensus."""
+    if not frames_1h:
+        return None
+    hours_since = (cutoff_utc - sched_dt).total_seconds() / 3600.0
+    if not (0.0 <= hours_since <= 6.0):
+        return None
+    per_sym: dict[str, Any] = {}
+    win_start = sched_dt - timedelta(hours=1)
+    for sym, df in frames_1h.items():
+        if df is None or df.empty:
+            continue
+        post_df = df.loc[(df.index >= win_start) & (df.index <= cutoff_utc)]
+        if post_df.empty:
+            continue
+        base_px = float(post_df.iloc[0]["open"])
+        last_px = float(post_df.iloc[-1]["close"])
+        atr_approx = float((df["high"].tail(14) - df["low"].tail(14)).mean()) if len(df) >= 14 else 0.0
+        if base_px > 0:
+            ret_pct = (last_px / base_px - 1.0) * 100.0
+            atr_mult = ((last_px - base_px) / atr_approx) if atr_approx > 0 else None
+            per_sym[sym] = {
+                "ret_since_release_pct": round(ret_pct, 4),
+                "atr_multiple": round(atr_mult, 3) if atr_mult is not None else None,
+            }
+    if not per_sym:
+        return None
+    return {
+        "status": "observed_post_release_price_impulse",
+        "hours_since_release": round(hours_since, 2),
+        "by_symbol": per_sym,
+        "note": "实测发布后价格冲击代理（绝非华尔街一致预期值）",
+    }
+
+
+def _normalize_tnx_yield(tnx_series: dict[str, Any]) -> tuple[float | None, float | None]:
+    """Return (yield_pct, delta_24h_bps) handling both CBOE 10x index (42.5) and percent (4.25) Yahoo quotes."""
+    if not tnx_series.get("ok") or tnx_series.get("close") is None:
+        return None, None
+    c_val = float(tnx_series["close"])
+    d24 = tnx_series.get("delta_24h")
+    # Yahoo ^TNX may quote either 10x yield (e.g. 42.5 = 4.25%) or direct yield % (e.g. 4.904 = 4.904%)
+    if abs(c_val) > 20.0:
+        y_pct = round(c_val / 10.0, 4)
+        bps = round(float(d24) * 10.0, 2) if d24 is not None else None
+    else:
+        y_pct = round(c_val, 4)
+        bps = round(float(d24) * 100.0, 2) if d24 is not None else None
+    return y_pct, bps
+
+
 def _match_calendar_and_releases(
     event_calendar: dict[str, Any] | None,
     verified_news: list[dict[str, Any]],
     *,
     cutoff_utc: datetime,
     imminent_hours: float,
+    frames_1h: dict[str, pd.DataFrame] | None = None,
 ) -> tuple[list[dict[str, Any]], bool, str | None]:
     events_structured: list[dict[str, Any]] = []
     imminent_veto = False
@@ -525,22 +853,39 @@ def _match_calendar_and_releases(
                 imminent_veto = True
                 imminent_title = f"{title} ({sched_dt.isoformat()})"
 
-            # Match verified actual release strictly from verified_news <= cutoff_utc
+            # Match verified actual release strictly requiring time window + agency match + specific topic tokens
             matched_actual = None
-            tok_title = {w for w in title.lower().split() if len(w) >= 3}
-            for item in verified_news:
-                if item.get("verification_status") != "verified" or item.get("freshness_status") == "future_excluded":
-                    continue
-                if item.get("news_kind") != "primary_release":
-                    continue
-                if tok_title and len(tok_title & set(item["title"].lower().split())) >= 1:
-                    matched_actual = {
-                        "status": "released_verified",
-                        "title": item["title"],
-                        "published_at_utc": item["published_at_utc"],
-                        "source_url": item["url"],
+            agency_str = str(ev.get("agency") or src_name)
+            import re as _re
+            sched_tokens = {
+                w for w in _re.findall(r"[a-z0-9]+", title.lower())
+                if len(w) >= 3 and not w.isdigit() and w not in _CALENDAR_STOPWORDS
+            }
+            if cutoff_utc >= sched_dt - timedelta(minutes=15) and sched_tokens:
+                win_lo = sched_dt - timedelta(minutes=15)
+                win_hi = min(cutoff_utc, sched_dt + timedelta(hours=12))
+                for item in verified_news:
+                    if item.get("verification_status") != "verified" or item.get("freshness_status") == "future_excluded":
+                        continue
+                    if item.get("news_kind") != "primary_release":
+                        continue
+                    pub_dt = _ts_utc(item.get("published_at_utc"))
+                    if pub_dt is None or not (win_lo <= pub_dt <= win_hi):
+                        continue
+                    if not _agency_matches_news_item(agency_str, item):
+                        continue
+                    item_tokens = {
+                        w for w in _re.findall(r"[a-z0-9]+", str(item.get("title") or "").lower())
+                        if len(w) >= 3 and not w.isdigit() and w not in _CALENDAR_STOPWORDS
                     }
-                    break
+                    if sched_tokens & item_tokens:
+                        matched_actual = {
+                            "status": "released_verified",
+                            "title": item["title"],
+                            "published_at_utc": item["published_at_utc"],
+                            "source_url": item["url"],
+                        }
+                        break
             if matched_actual is None:
                 matched_actual = {
                     "status": "not_yet_released" if hours_ahead > 0 else "release_unverified",
@@ -549,9 +894,10 @@ def _match_calendar_and_releases(
                     "source_url": None,
                 }
 
+            reaction_proxy = _post_release_reaction_proxy(sched_dt, cutoff_utc=cutoff_utc, frames_1h=frames_1h)
             events_structured.append(
                 {
-                    "agency": ev.get("agency") or src_name,
+                    "agency": agency_str,
                     "title": title,
                     "tier1_macro": is_tier1,
                     "schedule": {
@@ -564,6 +910,7 @@ def _match_calendar_and_releases(
                         "status": "supplied" if ev.get("consensus") is not None else "unavailable_in_official_public_feed",
                     },
                     "actual": matched_actual,
+                    "post_release_market_reaction": reaction_proxy,
                 }
             )
     events_structured.sort(key=lambda e: abs(e["schedule"]["hours_from_cutoff"]))
@@ -579,8 +926,11 @@ def build_macro_evidence(
     vix_summary: dict[str, Any],
     cutoff_utc: datetime,
     cfg: dict[str, Any],
+    intraday_macro: dict[str, Any] | None = None,
+    frames_1h: dict[str, pd.DataFrame] | None = None,
+    replay_mode: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Build Domain 1 (Macro) EvidenceAtoms separating ICE DXY, proxies, daily rates, and events."""
+    """Build Domain 1 (Macro) EvidenceAtoms separating ICE DXY, intraday proxies, daily rates, and events."""
     cutoff_iso = cutoff_utc.isoformat()
     fcfg = cfg["freshness_limits"]
     mcfg = cfg["macro_and_tide_thresholds"]
@@ -922,9 +1272,109 @@ def build_macro_evidence(
         )
     )
 
-    # 1f. Key Economic Events (schedule / consensus / actual separation)
+    # 1b-extra & 1c-extra. Verified Public 1H Intraday Dollar (DX-Y.NYB) & Rates/TIPS (^TNX, TIP) Proxies
+    im_raw = intraday_macro or {}
+    im_pit_ok = (not replay_mode) or bool(im_raw.get("historical_point_in_time_verified"))
+    im_series = (im_raw.get("series") or {}) if im_pit_ok else {}
+
+    dx_y = im_series.get("DX-Y.NYB") or {}
+    dx_obs_dt = _ts_utc(dx_y.get("obs_at_utc"))
+    dx_fresh = "missing"
+    if dx_y.get("ok") and dx_obs_dt is not None:
+        if dx_obs_dt > cutoff_utc:
+            dx_fresh = "future_excluded"
+        else:
+            age_h = (cutoff_utc - dx_obs_dt).total_seconds() / 3600.0
+            dx_fresh = "fresh" if age_h <= 6.0 else ("lagged_usable" if age_h <= 72.0 else "stale_excluded")
+    if dx_fresh in {"fresh", "lagged_usable"}:
+        dx_p5 = dx_y.get("pct_5d")
+        dx_p24 = dx_y.get("pct_24h")
+        dx_thresh = float(mcfg.get("intraday_dxy_5d_pct", 0.75))
+        dx_ref = dx_p24 if (dx_p24 is not None and abs(float(dx_p24)) >= float(mcfg["dxy_24h_pct"])) else dx_p5
+        dx_lim = float(mcfg["dxy_24h_pct"]) if dx_ref is dx_p24 else dx_thresh
+        dx_dir = {s: "neutral" for s in SYMBOLS}
+        if dx_ref is not None:
+            if float(dx_ref) >= dx_lim:
+                dx_dir = {s: "bearish" for s in SYMBOLS}
+            elif float(dx_ref) <= -dx_lim:
+                dx_dir = {s: "bullish" for s in SYMBOLS}
+        atoms.append(
+            make_atom(
+                evidence_id="macro:intraday_dollar_proxy:DX_Y_NYB",
+                domain="macro",
+                factor_name="盘中美元期货/指数公开代理 (DX-Y.NYB 1H)",
+                source_name="Yahoo Finance Public Chart (DX-Y.NYB)",
+                source_url=dx_y.get("source_url"),
+                raw_sha256=dx_y.get("raw_sha256"),
+                data_tier="intraday_delayed_public",
+                observed_at_utc=dx_obs_dt.isoformat() if dx_obs_dt else None,
+                published_at_utc=dx_obs_dt.isoformat() if dx_obs_dt else None,
+                available_at_utc=dx_obs_dt.isoformat() if dx_obs_dt else None,
+                available_at_known=True,
+                retrieved_at_utc=im_raw.get("retrieved_at_utc") or cutoff_iso,
+                freshness_status=dx_fresh,
+                applies_to_symbols=list(SYMBOLS),
+                applies_to_horizons=["intraday", "swing_1_3d"],
+                value_summary={"close": dx_y.get("close"), "pct_24h": dx_p24, "pct_5d": dx_p5, "is_ice_dxy": False, "proxy_ticker": "DX-Y.NYB"},
+                direction_by_symbol=dx_dir,
+                causal_driver_group="usd_real_rate_tightening",
+                limitation_note="Yahoo DX-Y.NYB 1H 美元指数代理（受交易所延迟与交易时段约束，绝不冒充实时直连 ICE DXY）",
+            )
+        )
+
+    tnx = im_series.get("^TNX") or {}
+    tip_etf = im_series.get("TIP") or {}
+    tnx_dt = _ts_utc(tnx.get("obs_at_utc"))
+    tip_dt = _ts_utc(tip_etf.get("obs_at_utc"))
+    rates_dt = tnx_dt or tip_dt
+    rates_fresh = "missing"
+    if (tnx.get("ok") or tip_etf.get("ok")) and rates_dt is not None:
+        if rates_dt > cutoff_utc:
+            rates_fresh = "future_excluded"
+        else:
+            age_h = (cutoff_utc - rates_dt).total_seconds() / 3600.0
+            rates_fresh = "fresh" if age_h <= 24.0 else ("lagged_usable" if age_h <= 72.0 else "stale_excluded")
+    tnx_pct, tnx_bps_24h = _normalize_tnx_yield(tnx)
+    if rates_fresh in {"fresh", "lagged_usable"}:
+        tip_p24 = tip_etf.get("pct_24h") if tip_etf.get("ok") else None
+        bps_thr = float(mcfg.get("intraday_tnx_24h_bps", 6.0))
+        rt_dir = {s: "neutral" for s in SYMBOLS}
+        if tnx_bps_24h is not None:
+            if tnx_bps_24h >= bps_thr and (tip_p24 is None or float(tip_p24) <= -0.10):
+                rt_dir = {s: "bearish" for s in SYMBOLS}
+            elif tnx_bps_24h <= -bps_thr and (tip_p24 is None or float(tip_p24) >= 0.10):
+                rt_dir = {s: "bullish" for s in SYMBOLS}
+        atoms.append(
+            make_atom(
+                evidence_id="macro:intraday_rates_tips_proxy:TNX_TIP",
+                domain="macro",
+                factor_name="盘中 10Y 名义美债收益率与 TIPS 代理 (^TNX / TIP 1H)",
+                source_name="Yahoo Finance Public Chart (^TNX & TIP)",
+                source_url=tnx.get("source_url") or tip_etf.get("source_url"),
+                raw_sha256=tnx.get("raw_sha256") or tip_etf.get("raw_sha256"),
+                data_tier="proxy_series",
+                observed_at_utc=rates_dt.isoformat() if rates_dt else None,
+                published_at_utc=rates_dt.isoformat() if rates_dt else None,
+                available_at_utc=rates_dt.isoformat() if rates_dt else None,
+                available_at_known=True,
+                retrieved_at_utc=im_raw.get("retrieved_at_utc") or cutoff_iso,
+                freshness_status=rates_fresh,
+                applies_to_symbols=list(SYMBOLS),
+                applies_to_horizons=["intraday"],
+                value_summary={"tnx_yield_pct": tnx_pct, "tnx_delta_24h_bps": tnx_bps_24h, "tip_pct_24h": tip_p24, "intraday_realtime": False},
+                direction_by_symbol=rt_dir,
+                causal_driver_group="usd_real_rate_tightening",
+                limitation_note="^TNX 与 TIP ETF 属于盘中公开延迟市场代理（非商业实时 TIPS 实际利率报价），且同属利率紧缩因果组去重",
+            )
+        )
+
+    # 1f. Key Economic Events (schedule / consensus / actual separation + post-release reaction proxy)
     events_list, imminent_veto, imminent_title = _match_calendar_and_releases(
-        event_calendar, verified_news, cutoff_utc=cutoff_utc, imminent_hours=float(fcfg["event_imminent_veto_hours_ahead"])
+        event_calendar,
+        verified_news,
+        cutoff_utc=cutoff_utc,
+        imminent_hours=float(fcfg["event_imminent_veto_hours_ahead"]),
+        frames_1h=frames_1h,
     )
     cal_avail = isinstance(event_calendar, dict) and bool(event_calendar.get("present_sources"))
     ev_dir = {s: ("two_sided_risk" if imminent_veto else "neutral") for s in SYMBOLS}
@@ -954,13 +1404,17 @@ def build_macro_evidence(
             direction_by_symbol=ev_dir,
             causal_driver_group="scheduled_macro_event_risk",
             is_hard_gate_candidate=imminent_veto,
-            limitation_note="官方日程表仅含预计发布时间，不含市场一致预期值；已公布结果仅绑定截止前官方发布 RSS",
+            limitation_note="官方日程表仅含预计发布时间，不含市场一致预期值；已公布结果仅绑定同机构、发布时点之后的官方公报并附盘后实测脉冲代理",
         )
     )
 
     macro_summary = {
         "ice_dxy_available": any(a["evidence_id"] == "macro:ice_dxy" and a["freshness_status"] == "fresh" for a in atoms),
         "dxy_value": (dxy_live or {}).get("value") if isinstance(dxy_live, dict) and dxy_live.get("is_ice_dxy") else None,
+        "intraday_dollar_dx_y_nyb": dx_y.get("close") if dx_fresh in {"fresh", "lagged_usable"} else None,
+        "intraday_dollar_dx_y_nyb_pct_24h": dx_y.get("pct_24h") if dx_fresh in {"fresh", "lagged_usable"} else None,
+        "intraday_tnx_pct": tnx_pct if rates_fresh in {"fresh", "lagged_usable"} else None,
+        "intraday_tnx_delta_24h_bps": tnx_bps_24h if rates_fresh in {"fresh", "lagged_usable"} else None,
         "broad_dollar_dtwexbgs": dtwex.get("value") if dtwex["status"] == "ok" else None,
         "dollar_pct_5obs": dtwex.get("pct_change_5_obs") if dtwex["status"] == "ok" else None,
         "real_yield_dfii10_pct": dfii.get("value") if dfii["status"] == "ok" else None,
@@ -998,6 +1452,7 @@ def build_sentiment_flow_evidence(
     polymarket_ctx: dict[str, Any] | None,
     cutoff_utc: datetime,
     cfg: dict[str, Any],
+    intraday_macro: dict[str, Any] | None = None,
     replay_mode: bool = False,
 ) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
     """Build Domain 3 (Sentiment & Capital Flows) atoms across BTC, NDX100, Gold, and Polymarket."""
@@ -1254,11 +1709,17 @@ def build_sentiment_flow_evidence(
     )
 
     ex_net = exchange_netflow_ctx or {}
-    ex_avail = bool(ex_net.get("usable") and ex_net.get("netflow_btc") is not None)
+    ex_pit_ok = (not replay_mode) or bool(ex_net.get("historical_point_in_time_verified")) or bool(ex_net.get("available_at_utc"))
+    ex_avail_dt = _ts_utc(ex_net.get("available_at_utc") or ex_net.get("observed_at_utc"))
+    ex_obs_dt = _ts_utc(ex_net.get("observed_at_utc"))
+    ex_time_ok = (ex_avail_dt is not None and ex_avail_dt <= cutoff_utc and (cutoff_utc - ex_avail_dt).total_seconds() <= 72 * 3600)
+    ex_avail = bool(ex_pit_ok and ex_net.get("usable") and ex_net.get("netflow_btc") is not None and ex_time_ok)
+    ex_fresh = "future_excluded" if (ex_avail_dt is not None and ex_avail_dt > cutoff_utc) else ("fresh" if (ex_avail and (cutoff_utc - ex_avail_dt).total_seconds() <= 48 * 3600) else ("lagged_usable" if ex_avail else "missing"))
     ex_dir = {s: "unknown" for s in SYMBOLS}
     if ex_avail:
         nf = float(ex_net["netflow_btc"])
-        ex_dir["BTCUSDT"] = "bearish" if nf > 0 else ("bullish" if nf < 0 else "neutral")
+        nf_thr = float(mcfg.get("btc_exchange_netflow_btc_min", 1500.0))
+        ex_dir["BTCUSDT"] = "bearish" if nf >= nf_thr else ("bullish" if nf <= -nf_thr else "neutral")
     atoms.append(
         make_atom(
             evidence_id="sentiment:btc:onchain_exchange_netflow",
@@ -1267,23 +1728,34 @@ def build_sentiment_flow_evidence(
             source_name=str(ex_net.get("source_name") or "unavailable_in_free_public_feeds"),
             source_url=ex_net.get("source_url"),
             raw_sha256=ex_net.get("raw_sha256"),
-            data_tier="realtime_verified" if ex_avail else "unavailable",
-            observed_at_utc=ex_net.get("observed_at_utc"),
-            published_at_utc=ex_net.get("observed_at_utc"),
-            available_at_utc=ex_net.get("observed_at_utc"),
+            data_tier="lagged_official_report" if ex_avail else "unavailable",
+            observed_at_utc=ex_obs_dt.isoformat() if ex_obs_dt else ex_net.get("observed_at_utc"),
+            published_at_utc=ex_avail_dt.isoformat() if ex_avail_dt else ex_net.get("available_at_utc"),
+            available_at_utc=ex_avail_dt.isoformat() if ex_avail_dt else ex_net.get("available_at_utc"),
             available_at_known=ex_avail,
             retrieved_at_utc=cutoff_iso,
-            freshness_status="fresh" if ex_avail else "missing",
+            freshness_status=ex_fresh,
             applies_to_symbols=["BTCUSDT"],
-            applies_to_horizons=["intraday", "swing_1_3d"],
-            value_summary={"netflow_btc": ex_net.get("netflow_btc"), "status": "available" if ex_avail else "unavailable"},
+            applies_to_horizons=["intraday", "swing_1_3d"] if ex_avail else ["swing_1_3d"],
+            value_summary={
+                "netflow_btc": ex_net.get("netflow_btc"),
+                "netflow_usd_musd": ex_net.get("netflow_usd_musd"),
+                "flow_in_btc": ex_net.get("flow_in_btc"),
+                "flow_out_btc": ex_net.get("flow_out_btc"),
+                "metric_status": ex_net.get("metric_status"),
+                "status": "available" if ex_avail else (ex_net.get("reason") or "unavailable"),
+            },
             direction_by_symbol=ex_dir,
             causal_driver_group="btc_exchange_onchain_flow",
-            limitation_note="当前公开免费数据源不含经核验的交易所钱包地址标签净流数据（保持缺失/未知，不与 mempool 混为一谈）",
+            limitation_note=(
+                "CoinMetrics 社区 API 按 status-time 严格门控的交易所链上净流入/流出（日频/flash；绝不与 mempool 混为一谈）"
+                if ex_avail
+                else "当前未获取到经 status-time 核验的交易所钱包净流数据（保持缺失/未知，不与 mempool 混为一谈）"
+            ),
         )
     )
 
-    # 3E. Nasdaq-100: VIX (can_decide_direction_alone=False!) + Relative Breadth + SEC EDGAR Events
+    # 3E. Nasdaq-100: VIX (can_decide_direction_alone=False!) + Relative Breadth (ALFRED + QQEW/QQQ 1H) + SEC EDGAR Events
     vix = _series_stats(alfred_series.get("VIXCLS"), cutoff_utc=cutoff_utc, max_age_days=int(fcfg["alfred_daily_max_age_days"]))
     vix_elevated = False
     vix_dir = {s: "unknown" for s in SYMBOLS}
@@ -1338,32 +1810,60 @@ def build_sentiment_flow_evidence(
             rel_dir["NDX100USDT"] = "bearish"
         else:
             rel_dir["NDX100USDT"] = "neutral"
+
+    im_raw_b = intraday_macro or {}
+    im_pit_b = (not replay_mode) or bool(im_raw_b.get("historical_point_in_time_verified"))
+    qqew_qqq_5d = im_raw_b.get("qqew_minus_qqq_5d_pct") if im_pit_b else None
+    qqew_qqq_24h = im_raw_b.get("qqew_minus_qqq_24h_pct") if im_pit_b else None
+    qqew_obs_dt = _ts_utc((((im_raw_b.get("series") or {}).get("QQEW")) or {}).get("obs_at_utc"))
+    qqew_ok = bool(im_pit_b and qqew_qqq_5d is not None and qqew_obs_dt is not None and qqew_obs_dt <= cutoff_utc and (cutoff_utc - qqew_obs_dt).total_seconds() <= 72 * 3600)
+    if qqew_ok and rel_spread is None:
+        eq_thr = float(mcfg.get("qqew_qqq_5d_spread_pct", 0.75))
+        if float(qqew_qqq_5d) >= eq_thr:
+            rel_dir["NDX100USDT"] = "bullish"  # broad equal-weight participation
+        elif float(qqew_qqq_5d) <= -eq_thr:
+            rel_dir["NDX100USDT"] = "bearish"  # narrow cap-weight divergence
+        else:
+            rel_dir["NDX100USDT"] = "neutral"
+
+    rs_has = (rel_spread is not None) or qqew_ok
+    rs_fresh = "fresh" if (qqew_ok and (cutoff_utc - qqew_obs_dt).total_seconds() <= 24 * 3600) else ("lagged_usable" if rs_has else "missing")
     atoms.append(
         make_atom(
             evidence_id="sentiment:ndx:tech_relative_strength",
             domain="sentiment_flow",
-            factor_name="科技相对大盘强度 (NASDAQ100 vs SP500 5日差值) 及广度缺口",
-            source_name="ALFRED (St. Louis Fed)",
-            source_url=ndx_s.get("source_url") or spx_s.get("source_url"),
-            raw_sha256=ndx_s.get("raw_sha256"),
-            data_tier="latest_daily_vintage",
-            observed_at_utc=ndx_s.get("published_or_observed_utc"),
-            published_at_utc=None,
-            available_at_utc=ndx_s.get("available_at_utc"),
-            available_at_known=rel_spread is not None,
-            retrieved_at_utc=ndx_s.get("retrieved_at_utc") or cutoff_iso,
-            freshness_status="lagged_usable" if rel_spread is not None else "missing",
+            factor_name="科技相对大盘强度 (NASDAQ100/SP500 + QQEW/QQQ 广度代理)",
+            source_name=(
+                "ALFRED + Yahoo QQEW/QQQ 1H"
+                if (rel_spread is not None and qqew_ok)
+                else ("Yahoo Public Chart (QQEW vs QQQ 1H)" if qqew_ok else "ALFRED (St. Louis Fed)")
+            ),
+            source_url=((((im_raw_b.get("series") or {}).get("QQEW")) or {}).get("source_url") if qqew_ok else (ndx_s.get("source_url") or spx_s.get("source_url"))),
+            raw_sha256=((((im_raw_b.get("series") or {}).get("QQEW")) or {}).get("raw_sha256") if qqew_ok else ndx_s.get("raw_sha256")),
+            data_tier="intraday_delayed_public" if qqew_ok else "latest_daily_vintage",
+            observed_at_utc=qqew_obs_dt.isoformat() if qqew_ok and qqew_obs_dt else ndx_s.get("published_or_observed_utc"),
+            published_at_utc=qqew_obs_dt.isoformat() if qqew_ok and qqew_obs_dt else None,
+            available_at_utc=qqew_obs_dt.isoformat() if qqew_ok and qqew_obs_dt else ndx_s.get("available_at_utc"),
+            available_at_known=rs_has,
+            retrieved_at_utc=(im_raw_b.get("retrieved_at_utc") if qqew_ok else ndx_s.get("retrieved_at_utc")) or cutoff_iso,
+            freshness_status=rs_fresh,
             applies_to_symbols=["NDX100USDT"],
-            applies_to_horizons=["swing_1_3d"],
+            applies_to_horizons=["intraday", "swing_1_3d"] if qqew_ok else ["swing_1_3d"],
             value_summary={
                 "ndx_5obs_pct": ndx_s.get("pct_change_5_obs"),
                 "spx_5obs_pct": spx_s.get("pct_change_5_obs"),
                 "ndx_minus_spx_pct": rel_spread,
-                "exchange_intraday_advance_decline": "unavailable_no_free_verified_feed",
+                "qqew_minus_qqq_5d_pct": qqew_qqq_5d,
+                "qqew_minus_qqq_24h_pct": qqew_qqq_24h,
+                "breadth_measure": "equal_vs_cap_weight_qqew_qqq_proxy" if qqew_ok else "unavailable_no_free_verified_feed",
             },
             direction_by_symbol=rel_dir,
             causal_driver_group="ndx_tech_breadth",
-            limitation_note="使用日频 NASDAQ100/SP500 相对表现代理；纳指成分股盘中涨跌家数与成交广度缺失",
+            limitation_note=(
+                "已接入 QQEW(等权)/QQQ(市值加权) 1H 相对广度代理及 ALFRED 日频相对强弱（受美股交易时段约束，仍非盘中全成分涨跌家数）"
+                if qqew_ok
+                else "使用日频 NASDAQ100/SP500 相对表现代理；纳指成分股盘中涨跌家数与成交广度缺失"
+            ),
         )
     )
 
@@ -1751,8 +2251,8 @@ def build_forecast_and_model_evidence(
                 raw_sha256=canonical_sha256(neural_block),
                 data_tier="realtime_verified" if neural_block["weights_ran"] else "unavailable",
                 observed_at_utc=neural_block["input_cutoff_utc"],
-                published_at_utc=neural_block["run_at_utc"] or neural_block["input_cutoff_utc"],
-                available_at_utc=neural_block["run_at_utc"] or neural_block["input_cutoff_utc"],
+                published_at_utc=neural_block["input_cutoff_utc"],
+                available_at_utc=neural_block["input_cutoff_utc"],
                 available_at_known=bool(neural_block["weights_ran"]),
                 retrieved_at_utc=cutoff_iso,
                 freshness_status=neural_fresh,
@@ -1849,6 +2349,12 @@ def collect_judgment_inputs(
     collection_errors.update({f"alfred:{k}": v for k, v in alfred_errors.items()})
 
     dxy_live = fetch_public_dxy_proxy(cutoff_utc=bar_cutoff_utc)
+    try:
+        intraday_macro = fetch_yahoo_intraday_macro_and_breadth(bar_cutoff_utc=bar_cutoff_utc)
+        collection_errors.update({f"yahoo_intraday:{k}": v for k, v in (intraday_macro.get("errors") or {}).items()})
+    except Exception as exc:
+        intraday_macro = {"ok": False, "series": {}, "errors": {"yahoo": type(exc).__name__}}
+        collection_errors["yahoo_intraday"] = type(exc).__name__
 
     try:
         event_calendar = fetch_official_event_calendar(now=decision_cutoff_utc)
@@ -1883,6 +2389,21 @@ def collect_judgment_inputs(
         collection_errors["btc_onchain"] = type(exc).__name__
 
     try:
+        exchange_netflow_ctx = fetch_coinmetrics_btc_exchange_flows(decision_cutoff_utc=decision_cutoff_utc)
+        if not exchange_netflow_ctx.get("usable") and exchange_netflow_ctx.get("reason"):
+            collection_errors["coinmetrics_netflow"] = str(exchange_netflow_ctx["reason"])
+    except Exception as exc:
+        exchange_netflow_ctx = {"usable": False, "reason": type(exc).__name__}
+        collection_errors["coinmetrics_netflow"] = type(exc).__name__
+
+    try:
+        venue_micro = fetch_bitget_venue_microstructure(symbols, decision_cutoff_utc=decision_cutoff_utc)
+        collection_errors.update({f"venue_micro:{k}": v for k, v in (venue_micro.get("errors") or {}).items()})
+    except Exception as exc:
+        venue_micro = {"ok": False, "symbols": {}, "errors": {"venue": type(exc).__name__}}
+        collection_errors["venue_micro"] = type(exc).__name__
+
+    try:
         polymarket_ctx = fetch_prediction_markets(now=decision_cutoff_utc)
     except Exception as exc:
         polymarket_ctx = {"usable_for_research": False, "events": [], "error": type(exc).__name__}
@@ -1900,13 +2421,17 @@ def collect_judgment_inputs(
         if c1h:
             series_for_fc[sym] = {"closes": [float(c["close"]) for c in c1h], "last_close_at_utc": c1h[-1]["close_at_utc"], "timeframe": "1H_closed"}
     try:
-        fc_path = ROOT / "artifacts" / "judgment_v3_chronos_tmp.json"
-        chronos_payload = run_chronos_tiny(series_for_fc, fc_path, allow_download=False)
+        with tempfile.TemporaryDirectory(prefix="piia_chronos_") as tmpdir:
+            fc_path = Path(tmpdir) / "chronos_out.json"
+            chronos_payload = run_chronos_tiny(series_for_fc, fc_path, allow_download=False)
         chronos_payload["run_at_utc"] = datetime.now(timezone.utc).isoformat()
     except Exception as exc:
         chronos_payload = {"weights_ran": False, "reason": type(exc).__name__, "forecasts": {}}
 
-    collected_at_utc = datetime.now(timezone.utc).isoformat()
+    collected_now = datetime.now(timezone.utc)
+    if now_override is None:
+        decision_cutoff_utc = max(decision_cutoff_utc, collected_now)
+    collected_at_utc = collected_now.isoformat()
     return {
         "is_synthetic_demo": False,
         "replay_mode": False,
@@ -1920,12 +2445,14 @@ def collect_judgment_inputs(
         "tiers_snapshot": tiers_snap,
         "alfred_series": alfred_series,
         "dxy_live": dxy_live,
+        "intraday_macro": intraday_macro,
         "event_calendar": event_calendar,
         "fear_greed": fear_greed_ctx,
         "etf_flows": etf_ctx,
         "gold_cot": gold_cot_ctx,
         "onchain": onchain_ctx,
-        "exchange_netflow": None,
+        "exchange_netflow": exchange_netflow_ctx,
+        "venue_microstructure": venue_micro,
         "gold_etf_flows": None,
         "polymarket": polymarket_ctx,
         "raw_news_items": [*rss_items, *edgar_items],

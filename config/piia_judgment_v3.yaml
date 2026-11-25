@@ -5,7 +5,7 @@
 # to dedicated shadow ledgers (never modifying v2.2.1 or v1 ledgers).
 
 protocol_id: PIIA_TRACEABLE_JUDGMENT_V3
-version: "3.1.0"
+version: "3.2.0"
 baseline_control_version: "2.2.1"
 baseline_commit: "74ce2eeb0c9ae759001030272fec91ec3992a415"
 prospective_freeze_started_utc: "2026-11-23T15:00:00+00:00"
@@ -81,6 +81,14 @@ macro_and_tide_thresholds:
   forecast_support_atr_mult: 0.50
   news_primary_recent_hours: 12.0
   news_duplicate_jaccard_min: 0.70
+  intraday_dxy_5d_pct: 0.75
+  intraday_tnx_24h_bps: 6.0
+  qqew_qqq_5d_spread_pct: 0.75
+  btc_exchange_netflow_btc_min: 1500.0
+
+venue_microstructure:
+  mark_last_warn_bps: 25.0
+  mark_last_gate_bps: 50.0
 
 shadow_paper:
   starting_cash_usdt: 500.0
