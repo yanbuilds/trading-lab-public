@@ -149,6 +149,69 @@ def _round_long_decimals(text: str) -> str:
     return _LONG_DEC_RE.sub(lambda m: f"{float(m.group(1)):.2f}", text)
 
 
+_SETUP_CN = {
+    "range_reversion": "震荡极值均值回归",
+    "trend_breakout": "趋势突破",
+    "trend_pullback": "趋势回踩",
+    "none": "无触发形态",
+}
+_FACTOR_PREFIX_LABELS = (
+    ("macro:rate_expectations:DGS2_minus_DFF", "2Y-DFF 利率预期"),
+    ("macro:nominal_rates:DGS10_DGS2", "10Y/2Y 美债收益率"),
+    ("macro:real_yield_daily:DFII10", "10Y 实际利率"),
+    ("macro:fed_net_liquidity", "美联储净流动性"),
+    ("macro:broad_dollar_proxy:DTWEXBGS", "广义美元"),
+    ("macro:intraday_dollar_proxy:DX_Y_NYB", "美元盘中代理"),
+    ("macro:intraday_rates_tips_proxy:TNX_TIP", "盘中美债/TIPS"),
+    ("macro:ice_dxy", "ICE DXY"),
+    ("macro:real_yield_intraday", "盘中 TIPS 实际利率"),
+    ("sentiment:btc:spot_etf_flows", "BTC 现货 ETF 净流"),
+    ("sentiment:btc:onchain_exchange_netflow", "BTC 交易所链上净流"),
+    ("sentiment:btc:onchain_network_activity", "BTC mempool 拥堵"),
+    ("sentiment:btc:fear_greed", "恐慌贪婪指数"),
+    ("sentiment:ndx:tech_relative_strength", "QQEW/QQQ 科技广度"),
+    ("sentiment:ndx:vix_volatility_backdrop", "VIX 高波动"),
+    ("sentiment:xau:cftc_cot_lagged", "黄金 COT 持仓"),
+    ("sentiment:xau:gold_etf_flows", "黄金 ETF 净流"),
+    ("sentiment:polymarket:filtered_events", "Polymarket 赔率"),
+    ("tide:macro_backdrop", "宏观潮汐大环境"),
+)
+
+
+def _short_factor_label(raw: Any, *, with_dir: bool = False) -> str:
+    s = str(raw or "").strip()
+    if not s:
+        return ""
+    dir_cn = ""
+    eid = ""
+    m = _ATOM_LINE_RE.match(s)
+    if m:
+        eid = m.group("eid")
+        dir_cn = _DIR_CN.get(m.group("dir"), "")
+    elif s.startswith("["):
+        eid = s[1:].split("]", 1)[0]
+    for prefix, label in _FACTOR_PREFIX_LABELS:
+        if eid.startswith(prefix) or prefix in s:
+            return f"{label}{dir_cn}" if (with_dir and dir_cn) else label
+    if eid.endswith(":funding_and_oi") or "funding_and_oi" in s:
+        return "资金费率/OI"
+    if eid.endswith(":chronos_neural") or "chronos_neural" in s:
+        return f"Chronos 预测{dir_cn}" if (with_dir and dir_cn) else "Chronos 预测"
+    if eid.endswith(":statistical_drift_168h") or "statistical_drift_168h" in s:
+        return f"168h 统计漂移{dir_cn}" if (with_dir and dir_cn) else "168h 统计漂移"
+    if eid.startswith("news:") or "[原始]" in s:
+        body = re.sub(r"^\[[^\]]+\]\s*(\[原始\]\s*)?", "", s)
+        head = body.split("(", 1)[0].strip()
+        return (head[:26] + "…") if len(head) > 26 else head
+    if "向上突破反转候选" in s:
+        return "1H 上破 48h 高点"
+    if "向下破位反转候选" in s:
+        return "1H 下破 48h 低点"
+    if "潮汐大环境" in s:
+        return "宏观潮汐大环境"
+    return _humanize_evidence_item(s)
+
+
 def _humanize_evidence_item(raw: Any) -> str:
     s = str(raw or "").strip()
     if not s:
@@ -162,11 +225,10 @@ def _humanize_evidence_item(raw: Any) -> str:
         return f"**{d_cn}{r_cn}** — {name_clean}（{m.group('src').strip()}，{ts_clean}）"
     if s.startswith("[tide:macro_backdrop:"):
         body = re.sub(r"^\[tide:macro_backdrop:[^\]]+\]\s*", "", s)
-        body = re.sub(r"\s*->\s*[A-Z0-9]+\s+tailwind$", "（对该标的构成宏观顺风）", body)
-        body = re.sub(r"\s*->\s*[A-Z0-9]+\s+headwind$", "（对该标的构成宏观逆风）", body)
+        body = re.sub(r"\s*->\s*[A-Z0-9]+\s+tailwind$", "（顺风支撑）", body)
+        body = re.sub(r"\s*->\s*[A-Z0-9]+\s+headwind$", "（逆风压制）", body)
         return body
-    if s.startswith("[sentiment:"):
-        s = re.sub(r"^\[[^\]]+\]\s*", "", s)
+    s = re.sub(r"^\[[^\]]+\]\s*", "", s)
     s = _ISO_TS_RE.sub(lambda tm: _fmt_utc_short(tm.group(0)), s)
     return _round_long_decimals(s)
 
@@ -184,6 +246,115 @@ def _dedup_list(items: list[Any], limit: int, *, humanize: bool = False) -> list
     return out
 
 
+def _concise_rationale(sym: str, j: dict[str, Any], pos: dict[str, Any]) -> str:
+    """Build a crisp 1-line trader explanation of why intraday & 1-3d are long/short/neutral."""
+    i_d, s_d = j["intraday"], j["swing_1_3d"]
+    i_lbl, s_lbl = i_d["final_label_cn"], s_d["final_label_cn"]
+    pstate = pos.get("position_state") or ""
+    adx = (pos.get("metrics") or {}).get("adx14")
+    adx_txt = f" (ADX {float(adx):.1f})" if adx is not None else ""
+
+    if i_d["hard_gates_triggered"] or s_d["hard_gates_triggered"]:
+        gates = i_d["hard_gates_triggered"] or s_d["hard_gates_triggered"]
+        return f"触发风控门控（{gates[0]}）强制观望"
+
+    if pstate == "range_consolidation":
+        struct_txt = f"1H 震荡{adx_txt}"
+    elif pstate == "potential_bullish_reversal":
+        struct_txt = "1H 上破 48h 高点"
+    elif pstate == "potential_bearish_reversal":
+        struct_txt = "1H 下破 48h 低点"
+    elif pstate in {"downtrend_aligned", "bearish_trend"} or "顺势空头" in str(pos.get("structure_kind_cn") or ""):
+        struct_txt = "1D/4H/1H 空头共振"
+    elif pstate in {"uptrend_aligned", "bullish_trend"} or "顺势多头" in str(pos.get("structure_kind_cn") or ""):
+        struct_txt = "1D/4H/1H 多头共振"
+    else:
+        struct_txt = str(pos.get("structure_kind_cn") or "多周期分化")
+
+    drv_labels = _dedup_list(
+        [
+            _short_factor_label(d.get("summary") or d.get("group"))
+            for d in (*(i_d.get("active_causal_drivers") or []), *(s_d.get("active_causal_drivers") or []))
+            if d.get("vote")
+        ],
+        3,
+    )
+    drv_txt = " + ".join(drv_labels)
+
+    if i_d["changed_vs_technical"] or s_d["changed_vs_technical"]:
+        verb = f"改判为{s_lbl}"
+        base = f"{struct_txt}，叠加{drv_txt}共振{verb}" if drv_txt else f"{struct_txt}，多维因子共振{verb}"
+    elif i_lbl == "观望" and s_lbl != "观望":
+        base = f"日内{struct_txt}观望；1–3日随{pos.get('daily_dir') == 'down' and '日线空头' or '日线多头'}"
+        if drv_txt:
+            base += f"（{drv_txt}）{s_lbl}"
+        else:
+            base += s_lbl
+    elif i_lbl == "观望" and s_lbl == "观望":
+        base = f"{struct_txt}，外部因子分歧或不足以破局，继续观望"
+    else:
+        base = f"{struct_txt}，与外部驱动（{drv_txt}）同向确认{s_lbl}" if drv_txt else f"{struct_txt}确认{s_lbl}"
+
+    pe = j.get("paper_eligibility") or {}
+    if pe.get("eligible"):
+        side_cn = "做空" if pe.get("side") == "short" else "做多"
+        setup_cn = _SETUP_CN.get(str(j.get("official_v2_2_1_setup_type") or ""), str(j.get("official_v2_2_1_setup_type") or ""))
+        base += f"；短线另触发 {setup_cn}{side_cn}"
+    elif pe.get("status") == "pending_review":
+        base += "；短线信号触发异常待复核"
+    return base
+
+
+def _render_trade_plan_lines(sym: str, j: dict[str, Any], pos: dict[str, Any], earliest_exec_utc: Any) -> list[str]:
+    pe = j["paper_eligibility"]
+    setup = str(j.get("official_v2_2_1_setup_type") or "none")
+    setup_cn = _SETUP_CN.get(setup, setup)
+    if pe.get("status") == "pending_review":
+        trigs = "；".join(t.get("detail") or t.get("trigger") for t in (pe.get("review_trigger_details") or [])) or ", ".join(pe.get("review_triggers") or [])
+        return [
+            f"- **⚠️ {SYMBOL_LABELS[sym]}｜`v2.2.1` {j['official_v2_2_1_signal']} ({setup_cn}) — 待人工复核（暂拦截开仓）**",
+            f"  - 拦截原因：{trigs}",
+        ]
+    if not pe.get("eligible"):
+        return []
+
+    ep = pe.get("entry_plan") or {}
+    xp = pe.get("exit_plan") or {}
+    ps = pe.get("position_sizing") or {}
+    cr = pe.get("cost_and_risk") or {}
+    lvl = pos.get("invalidation_levels") or {}
+
+    side_cn = "做空" if pe.get("side") == "short" else "做多"
+    ref_px = ep.get("reference_price") or j.get("last_close")
+    fill_px = ep.get("assumed_fill_with_slippage") or ref_px
+    sl_px = xp.get("initial_stop_loss")
+    sl_fill = xp.get("assumed_stop_fill")
+    be_trig = xp.get("breakeven_ratchet_trigger_price")
+    be_stop = xp.get("fee_adjusted_breakeven_stop")
+    max_h = xp.get("max_hold_hours")
+    rule = str(xp.get("trailing_or_target_rule") or "")
+
+    sl_pct_txt = f"（距入场 `{abs(float(sl_px) - float(fill_px)) / float(fill_px) * 100.0:.2f}%`）" if (sl_px and fill_px) else ""
+    bb_mid = lvl.get("bb_mid")
+    if "bb_sma20_mid" in rule and bb_mid and fill_px:
+        tp_pct = ((float(fill_px) - float(bb_mid)) / float(fill_px) * 100.0) if pe.get("side") == "short" else ((float(bb_mid) - float(fill_px)) / float(fill_px) * 100.0)
+        tp_txt = f"**{_fmt_num(bb_mid)}**（当前 1H 布林中轨 SMA20，空间 `{tp_pct:+.2f}%`，随每根 1H 收盘动态调整）"
+    else:
+        tp_txt = "Chandelier 22h 2.5×ATR 移动止盈（或 1H+4H 均线同向反转平仓）"
+
+    be_txt = f"价格到达 `{_fmt_num(be_trig)}` 时止损上/下推至保本价 `{_fmt_num(be_stop)}`" if (be_trig and be_stop) else "无"
+    hold_txt = f"**{max_h} 小时**（超时无论盈亏平仓；最早 `{_fmt_bj_short(earliest_exec_utc)}` / `{_fmt_utc_short(earliest_exec_utc)}` 起可执行）" if max_h else "按规则离场"
+
+    return [
+        f"##### ⚡ {SYMBOL_LABELS[sym]}｜`{side_cn}` · {setup_cn}（`v2.2.1` 纸面可执行）",
+        f"- **计划入场**：参考价 `{_fmt_num(ref_px)}`（含滑点模拟成交约 `{_fmt_num(fill_px)}`，以下一根 1H 开盘起按规则挂单/市价）",
+        f"- **初始止损**：**`{_fmt_num(sl_px)}`**{sl_pct_txt}（含滑点止损 `{_fmt_num(sl_fill)}`｜预计止损净亏 `{_fmt_num(cr.get('estimated_normal_stop_loss_usdt'))}` USDT / `{_fmt_num(cr.get('estimated_normal_stop_loss_pct_equity'))}%` 净值）",
+        f"- **止盈与保本**：目标 {tp_txt}；**移动保本**：{be_txt}",
+        f"- **最长持仓**：{hold_txt}",
+        f"- **参考仓位与风控**：`{ps.get('qty_contracts')}` 合约（名义约 `{_fmt_num(ps.get('notional_usdt'))}` USDT，`{_fmt_num(ps.get('leverage'), 1)}x` 逐仓，保证金 `{_fmt_num(ps.get('initial_margin_usdt'))}` USDT，剩余现金 `{_fmt_num(ps.get('free_cash_after_entry_usdt'))}` USDT｜1% 风险预算 `{_fmt_num(cr.get('risk_budget_usdt'))}` USDT，估算强平 `{_fmt_num(cr.get('estimated_isolated_liquidation'))}`）",
+    ]
+
+
 def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
     table_rows = build_summary_table_rows(packet)
     lc = packet.get("lifecycle_timestamps") or {}
@@ -191,118 +362,80 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
     tide = packet["tide"]
     macro = packet["macro_summary"]
     sent_sum = packet.get("sentiment_summary") or {}
-    vix = (sent_sum.get("vix") or {})
+    vix = sent_sum.get("vix") or {}
+    earliest_exec = lc.get("earliest_executable_at_utc") or packet["cutoff_utc"]
 
     lines = [
-        f"### 三合约多维研判报告（{_fmt_bj_short(packet['cutoff_utc'])} / {_fmt_utc_short(packet['cutoff_utc'])}）",
+        f"### 三合约研判简报（{_fmt_bj_short(packet['cutoff_utc'])} / {_fmt_utc_short(packet['cutoff_utc'])}）",
         "",
-        f"> **研究声明**：快照 `{packet['judgment_hash'][:12]}` | 影子参考资金 `{cash_ref}` USDT | 无自动/实盘下单权限 | 冻结 `v2.2.1` 正式信号分栏展示。",
+        f"> 快照 `{packet['judgment_hash'][:12]}`｜参考资金 `{cash_ref}` USDT｜仅作研究参考，无实盘下单权限｜冻结 `v2.2.1` 信号与多维研判严格分栏",
         "",
-        "#### 一句话结论速览",
+        "#### 一、今日结论总览",
+        "| 品种 | 最新收盘 | 日内 | 1–3日 | `v2.2.1` 信号 | 一句话逻辑 |",
+        "| --- | ---: | :---: | :---: | :---: | --- |",
     ]
-    for sym in ORDERED_SYMBOLS:
-        j = packet["judgments"][sym]
-        i_d, s_d = j["intraday"], j["swing_1_3d"]
-        pe = j["paper_eligibility"]
-        pe_note = f"⚡ v2.2.1 触发 `{j['official_v2_2_1_signal']}` ({j.get('official_v2_2_1_setup_type')})，纸面开仓={pe.get('label_cn')}" if j["official_v2_2_1_signal"] in {"long", "short"} else "v2.2.1 暂观望"
-        chg_note = "（**相对技术面已改判**）" if (i_d["changed_vs_technical"] or s_d["changed_vs_technical"]) else ""
-        lines.append(
-            f"- **{SYMBOL_LABELS[sym]}**（现价 `{_fmt_num(j.get('last_close'))}`）：日内 **{_bias_badge(i_d['final_label_cn'])}** / 1–3 日 **{_bias_badge(s_d['final_label_cn'])}**{chg_note} — {pe_note}"
-        )
-
-    lines.extend(
-        [
-            "",
-            "#### 核心判断总览",
-            "| 品种 | 最新收盘 | 纯技术面 (日内 / 1-3日) | 综合：日内 | 综合：1-3日 | 相对技术面 | `v2.2.1` 信号 | 纸面开仓 | 首要缺口 |",
-            "| --- | ---: | :---: | :---: | :---: | --- | :---: | :---: | --- |",
-        ]
-    )
     for r in table_rows:
+        sym = r["symbol"]
+        j = packet["judgments"][sym]
+        pos = tide["instrument_positions"][sym]
+        sig_txt = f"⚡ `{r['official_v2_2_1_signal']}` ({r['paper_eligible']})" if r["official_v2_2_1_signal"] in {"long", "short"} else "`stand_aside`"
+        rationale = _concise_rationale(sym, j, pos)
         lines.append(
-            f"| {r['label']} | `{_fmt_num(r['last_close'])}` | {r['technical_only']} | **{_bias_badge(r['intraday'])}** | **{_bias_badge(r['swing_1_3d'])}** | {r['changed_vs_technical']} | `{r['official_v2_2_1_signal']}` | {r['paper_eligible']} | {_humanize_gap(r['top_data_gap'])} |"
+            f"| **{r['label']}** | `{_fmt_num(r['last_close'])}` | **{_bias_badge(r['intraday'])}** | **{_bias_badge(r['swing_1_3d'])}** | {sig_txt} | {rationale} |"
         )
 
-    ice_dxy_txt = "实时直连可用" if macro.get("ice_dxy_available") else "缺失（未接入付费源）"
-    dx_y_txt = (
-        f"`{_fmt_num(macro.get('intraday_dollar_dx_y_nyb'))}` (24h `{_fmt_num(macro.get('intraday_dollar_dx_y_nyb_pct_24h'), 2, '%')}`)"
-        if macro.get("intraday_dollar_dx_y_nyb") is not None
-        else "缺失"
-    )
-    tnx_txt = (
-        f"`{_fmt_num(macro.get('intraday_tnx_pct'), 3, '%')}` (24h `{_fmt_num(macro.get('intraday_tnx_delta_24h_bps'), 1, ' bps')}`)"
-        if macro.get("intraday_tnx_pct") is not None
-        else "缺失"
-    )
-    dfii_txt = (
-        f"`{_fmt_num(macro.get('real_yield_dfii10_pct'), 2, '%')}` (5观测 `{_fmt_num(macro.get('real_yield_delta_5obs_bps'), 1, ' bps')}`)"
-        if macro.get("real_yield_dfii10_pct") is not None
-        else "缺失"
-    )
-    lines.extend(
-        [
-            "",
-            "#### 宏观大环境与市场潮汐",
-            f"- **大环境判定**：{tide['macro_backdrop']['state_cn']}",
-            f"- **市场周期阶段**：{tide['cycle_stage']['stage_cn']}（依据：`{tide['cycle_stage']['definition_used']}`）",
-            "",
-            "| 宏观因子 | 实时直连 | 公开延迟 / 日频代理 | 最新读数与变动 |",
-            "| --- | --- | --- | --- |",
-            f"| 美元强弱 | ICE DXY：{ice_dxy_txt} | Yahoo `DX-Y.NYB` 1H / ALFRED `DTWEXBGS` | {dx_y_txt} \\| 广义美元 `{_fmt_num(macro.get('broad_dollar_dtwexbgs'))}` (5观测 `{_fmt_num(macro.get('dollar_pct_5obs'), 2, '%')}`) |",
-            f"| 美国利率 | 盘中实时 TIPS：缺失 | Yahoo `^TNX` 1H / ALFRED `DFII10` | `^TNX` {tnx_txt} \\| 10Y实际利率 {dfii_txt} |",
-            f"| 利率与期限结构 | — | ALFRED `DGS10` / `DGS2` / `DFF` | 10Y `{_fmt_num(macro.get('dgs10_pct'), 2, '%')}` · 2Y `{_fmt_num(macro.get('dgs2_pct'), 2, '%')}` · 联邦基金 `{_fmt_num(macro.get('dff_pct'), 2, '%')}` |",
-            f"| 波动率背景 | — | ALFRED / CBOE `VIX` ({vix.get('observation_date') or '未知'}) | `{_fmt_num(vix.get('value'))}`（{'高波动风险区' if vix.get('elevated_volatility_regime') else '常态区间'}，仅限风险降权） |",
-            "",
-            f"- **黄金 vs 纳指传导机制**：{macro['gold_vs_ndx_divergence_note']}",
-            "",
-            "#### 分品种深度明细",
-        ]
-    )
+    plan_blocks: list[str] = []
+    for sym in ORDERED_SYMBOLS:
+        plan_blocks.extend(_render_trade_plan_lines(sym, packet["judgments"][sym], tide["instrument_positions"][sym], earliest_exec))
 
+    lines.extend(["", "#### 二、可执行纸面交易计划（`v2.2.1` 正式信号）"])
+    if plan_blocks:
+        lines.extend(plan_blocks)
+    else:
+        lines.append("- 当前三合约均未触发 `v2.2.1` 可开仓信号，纸面保持空仓观望（等待触发条件见下）。")
+
+    lines.extend(["", "#### 三、分品种研判与等待/失效位"])
     for sym in ORDERED_SYMBOLS:
         j = packet["judgments"][sym]
         pos = tide["instrument_positions"][sym]
         i_d, s_d = j["intraday"], j["swing_1_3d"]
-        chg_evs = j.get("evidence_that_changed_conclusion") or []
-        chg_lines = _dedup_list([f"[{c.get('horizon')}] {_humanize_evidence_item(c.get('detail'))}" for c in chg_evs], 4)
-        sup_lines = _dedup_list(list(i_d["supporting_evidence"]) + list(s_d["supporting_evidence"]), 4, humanize=True)
-        ctr_lines = _dedup_list(list(i_d["strongest_counterevidence"]) + list(s_d["strongest_counterevidence"]), 3, humanize=True)
-        inv_lines = _dedup_list(list(i_d["invalidation_conditions"]) + list(s_d["invalidation_conditions"]), 3, humanize=True)
-        gaps_list = [_humanize_gap(g) for g in sorted(set(i_d["data_gaps"] + s_d["data_gaps"]))]
-        supp = j.get("agent_or_human_supplement") or packet.get("agent_or_human_supplement") or {}
-        supp_txt = f"{supp.get('actor')}: {supp.get('note')} ({_fmt_utc_short(supp.get('recorded_at_utc'))}, 不可绕过风控)" if supp.get("provided") else "无"
+        lvl = pos.get("invalidation_levels") or {}
         sb = j.get("setup_bridge") or {}
         va = j.get("venue_microstructure_audit") or {}
+        supp = j.get("agent_or_human_supplement") or packet.get("agent_or_human_supplement") or {}
+
+        raw_ctr = _dedup_list(list(i_d["strongest_counterevidence"]) + list(s_d["strongest_counterevidence"]), 3)
+        ctr_short = _dedup_list([_short_factor_label(x, with_dir=True) for x in raw_ctr], 3)
+        inv_line = f"4H EMA50 `{_fmt_num(lvl.get('h4_ema50'))}` / 48h 通道 `{_fmt_num(lvl.get('donchian_48h_low'))} ~ {_fmt_num(lvl.get('donchian_48h_high'))}` 收盘突破或宏观跨过阈值"
 
         lines.extend(
             [
                 "",
-                f"##### {SYMBOL_LABELS[sym]}｜结构：`{pos['structure_kind_cn']}`",
-                f"- **日内（{_bias_badge(i_d['final_label_cn'])}）**：纯技术 `{i_d['technical_only']['label_cn']}` —— {_round_long_decimals(_ISO_TS_RE.sub(lambda tm: _fmt_utc_short(tm.group(0)), i_d['why_changed_or_unchanged_vs_technical']))}",
-                f"- **1–3 日（{_bias_badge(s_d['final_label_cn'])}）**：纯技术 `{s_d['technical_only']['label_cn']}` —— {_round_long_decimals(_ISO_TS_RE.sub(lambda tm: _fmt_utc_short(tm.group(0)), s_d['why_changed_or_unchanged_vs_technical']))}",
-                f"- **改判证据**：{('；'.join(chg_lines)) if chg_lines else '无外部因子推翻纯技术面'}",
-                "- **关键依据**：",
-                *(f"  - {x}" for x in (sup_lines or ["无"])),
-                "- **最强反证与风险提示**：",
-                *(f"  - {x}" for x in (ctr_lines or ["无"])),
-                "- **失效与改判条件**：",
-                *(f"  - {x}" for x in (inv_lines or ["无"])),
+                f"##### {SYMBOL_LABELS[sym]}｜`{pos['structure_kind_cn']}`",
+                f"- **研判逻辑**：{_concise_rationale(sym, j, pos)}",
+                f"- **主要反证与风险**：{('、'.join(ctr_short)) if ctr_short else '暂无明显强反证'}",
+                f"- **失效参考线**：{inv_line}",
                 f"- **研究→开仓等待条件 (`v2.2.1`)**：{sb.get('summary_cn') or '无'}",
                 f"- **交易所微观结构盘口/资金费率**：{va.get('summary_cn') or '未采集'}",
-                f"- **数据缺口**：{('、'.join(gaps_list)) if gaps_list else '无关键缺失'}",
-                f"- **人工/Agent 补充判断**：{supp_txt}",
             ]
         )
+        if supp.get("provided"):
+            lines.append(f"- **人工/Agent 补充判断**：{supp.get('actor')}: {supp.get('note')}（{_fmt_utc_short(supp.get('recorded_at_utc'))}，不可绕过风控）")
 
     fc_by_sym = (packet.get("forecast_and_models") or {}).get("by_symbol") or {}
     ai_prov = (packet.get("forecast_and_models") or {}).get("ai_provenance") or {}
+    dx_y_txt = f"`{_fmt_num(macro.get('intraday_dollar_dx_y_nyb'))}` ({_fmt_num(macro.get('intraday_dollar_dx_y_nyb_pct_24h'), 2, '%')})" if macro.get("intraday_dollar_dx_y_nyb") is not None else "缺失"
+    tnx_txt = f"`{_fmt_num(macro.get('intraday_tnx_pct'), 3, '%')}` ({_fmt_num(macro.get('intraday_tnx_delta_24h_bps'), 1, ' bps')})" if macro.get("intraday_tnx_pct") is not None else "缺失"
+    dfii_txt = f"`{_fmt_num(macro.get('real_yield_dfii10_pct'), 2, '%')}` ({_fmt_num(macro.get('real_yield_delta_5obs_bps'), 1, ' bps')})" if macro.get("real_yield_dfii10_pct") is not None else "缺失"
+
     lines.extend(
         [
             "",
-            "#### 模型预测对照（非校准交易概率）",
-            f"- **外部 AI 状态**：大模型研究=`{(ai_prov.get('llm_research_opinion') or {}).get('status')}`｜独立 AI 反方=`{(ai_prov.get('independent_ai_critic') or {}).get('status')}`（内置反方门控为确定性规则）",
+            "#### 四、宏观环境、Chronos 预测与审计速查",
+            f"- **宏观与周期**：{tide['macro_backdrop']['state_cn']}｜周期：`{tide['cycle_stage']['stage_cn']}`",
+            f"- **核心宏观代理**：美元 `DX-Y.NYB` {dx_y_txt} / 广义 `{_fmt_num(macro.get('broad_dollar_dtwexbgs'))}`｜利率 `^TNX` {tnx_txt} / 10Y实际利率 {dfii_txt}｜`VIX` `{_fmt_num(vix.get('value'))}`",
             "",
-            "| 品种 | 最新收盘 | Chronos 6h 中位 | Chronos 24h 中位 (对比现价) | 168h 统计漂移 (24h) | 模型运行状态 |",
+            "| 品种 | 现价 | Chronos 6h | Chronos 24h (对比现价) | 168h 统计漂移 | 状态 |",
             "| --- | ---: | ---: | ---: | ---: | :---: |",
         ]
     )
@@ -310,7 +443,7 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
         fc = fc_by_sym.get(sym) or {}
         cn = fc.get("chronos_neural") or {}
         bs = fc.get("baselines") or {}
-        last_c = fc.get("last_close") or (packet["judgments"][sym].get("last_close"))
+        last_c = fc.get("last_close") or packet["judgments"][sym].get("last_close")
         q50_24 = cn.get("q50_24h")
         if last_c and q50_24:
             pct_diff = ((float(q50_24) / float(last_c)) - 1.0) * 100.0
@@ -324,42 +457,14 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
         )
 
     ledger = packet.get("factor_usage_ledger") or {}
-    if ledger:
-        lines.extend(
-            [
-                "",
-                "#### 七大因子域审计摘要（API 成功 ≠ 参与判断；完整溯源见 JSON `factor_usage_ledger`）",
-                "| 因子域 | 触发改判/否决 | 有效背景参考 | 过期 / 缺失 / 未运行 |",
-                "| --- | --- | --- | --- |",
-            ]
-        )
-        cat_labels = {
-            "macro": "宏观",
-            "tide": "潮汐",
-            "sentiment_positioning": "情绪与仓位",
-            "etf_and_onchain": "ETF 与链上",
-            "polymarket": "Polymarket",
-            "news": "新闻与 IR",
-            "forecast_models": "预测模型与 AI",
-        }
-        for ckey, clabel in cat_labels.items():
-            entries = ledger.get(ckey) or []
-            chg = [e["factor_id"].split(":")[-1] for e in entries if e["participation_status"] == "changed_judgment"]
-            bg = [e["factor_id"].split(":")[-1] for e in entries if e["participation_status"] == "background_only"]
-            off = [
-                f"{e['factor_id'].split(':')[-1]}({e['participation_status_cn']})"
-                for e in entries
-                if e["participation_status"] in {"expired", "missing", "not_run"}
-            ]
-            chg_s = ", ".join(chg[:3]) + (f" (+{len(chg) - 3})" if len(chg) > 3 else "") if chg else "—"
-            bg_s = ", ".join(bg[:4]) + (f" (+{len(bg) - 4})" if len(bg) > 4 else "") if bg else "—"
-            off_s = ", ".join(off[:3]) + (f" 等共 {len(off)} 项" if len(off) > 3 else "") if off else "—"
-            lines.append(f"| **{clabel}** | {chg_s} | {bg_s} | {off_s} |")
-
+    used_cnt = sum(1 for entries in ledger.values() for e in entries if e.get("participated_in_judgment"))
+    chg_cnt = sum(1 for entries in ledger.values() for e in entries if e.get("participation_status") == "changed_judgment")
+    missing_labels = _dedup_list([_humanize_gap(m) for m in ((packet.get("audit_coverage") or {}).get("factors_missing") or [])], 6)
     lines.extend(
         [
             "",
-            f"> **完整时点链路**：K线截止 `{_fmt_utc_short(lc.get('bar_cutoff_utc', packet['cutoff_utc']))}`｜最新公告 `{_fmt_utc_short(lc.get('latest_announcement_published_at_utc'))}`｜首次抓取 `{_fmt_utc_short(lc.get('first_retrieved_at_utc'), include_sec=True)}`｜判断生成 `{_fmt_utc_short(lc.get('judgment_generated_at_utc'), include_sec=True)}`｜最早可成交 `{_fmt_utc_short(lc.get('earliest_executable_at_utc'))}`",
+            f"- **因子审计与缺口**：7 域共介入 `{used_cnt}` 项（改判驱动 `{chg_cnt}` 项），外部 AI=`{(ai_prov.get('llm_research_opinion') or {}).get('status')}` / 独立反方=`{(ai_prov.get('independent_ai_critic') or {}).get('status')}`｜缺失：{('、'.join(missing_labels)) if missing_labels else '无'}（完整逐项留痕见 JSON `factor_usage_ledger`）。",
+            f"- **时点链路**：K线截止 `{_fmt_utc_short(lc.get('bar_cutoff_utc', packet['cutoff_utc']))}` → 最新公告 `{_fmt_utc_short(lc.get('latest_announcement_published_at_utc'))}` → 判断生成 `{_fmt_utc_short(lc.get('judgment_generated_at_utc'), include_sec=True)}` → 最早可成交 `{_fmt_utc_short(earliest_exec)}`。",
         ]
     )
 
