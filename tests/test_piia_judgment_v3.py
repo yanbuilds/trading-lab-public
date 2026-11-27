@@ -304,6 +304,7 @@ def test_chat_workbench_qa_whatif_diff_and_isolated_shadow_ledger(tmp_path, monk
     assert len(q1["summary_table"]) == 3
     assert "`v2.2.1` 信号" in q1["markdown"] or "v2.2.1 信号" in q1["markdown"]
     assert "dir=" not in q1["markdown"] and "role=" not in q1["markdown"]
+    assert "[forecast:" not in q1["markdown"] and "[sentiment:" not in q1["markdown"] and "[macro:" not in q1["markdown"]
 
     # Q2: Why not short?
     q2 = answer_judgment_query("BTC为什么不做空？", packet=cur_pkt, previous_packet=prev_pkt)
@@ -975,24 +976,43 @@ def test_markdown_dedup_setup_bridge_and_chronos_run_window():
 
     ans = answer_judgment_query("今天黄金、BTC、纳指 100 看多还是看空？", packet=pkt)
     md = ans["markdown"]
-    assert "一句话结论速览" in md
+    assert "今日结论总览" in md
+    assert "可执行纸面交易计划" in md
     assert "研究→开仓等待条件 (`v2.2.1`)" in md
     assert "交易所微观结构盘口/资金费率" in md
-    assert "模型预测对照（非校准交易概率）" in md
-    assert "七大因子域审计摘要" in md
+    assert "Chronos 6h" in md
     assert "dir=" not in md and "role=" not in md
+    assert "[forecast:" not in md and "[sentiment:" not in md and "[macro:" not in md
 
-    # Verify nested evidence bullets have zero duplicates per section & symbol
-    cur_sec_items: list[str] | None = None
-    for line in md.splitlines():
-        if line.startswith("- **关键依据**：") or line.startswith("- **最强反证") or line.startswith("- **失效与改判条件**："):
-            cur_sec_items = []
-        elif line.startswith("  - ") and cur_sec_items is not None:
-            cur_sec_items.append(line[4:].strip())
-        else:
-            if cur_sec_items is not None:
-                assert len(cur_sec_items) == len(set(cur_sec_items)), f"Duplicate nested bullets: {cur_sec_items}"
-            cur_sec_items = None
+    # Verify explicit entry/stop-loss/take-profit/hold-hours rendering when paper_eligibility is eligible
+    pkt_trade = deepcopy(pkt)
+    pkt_trade["judgments"]["BTCUSDT"]["official_v2_2_1_signal"] = "short"
+    pkt_trade["judgments"]["BTCUSDT"]["official_v2_2_1_setup_type"] = "range_reversion"
+    pkt_trade["tide"]["instrument_positions"]["BTCUSDT"]["invalidation_levels"]["bb_mid"] = 60735.38
+    pkt_trade["judgments"]["BTCUSDT"]["paper_eligibility"] = {
+        "eligible": True,
+        "status": "eligible",
+        "label_cn": "是",
+        "review_required": False,
+        "review_triggers": [],
+        "side": "short",
+        "entry_plan": {"reference_price": 61466.8, "assumed_fill_with_slippage": 61436.07},
+        "exit_plan": {
+            "initial_stop_loss": 62231.23,
+            "assumed_stop_fill": 62262.34,
+            "fee_adjusted_breakeven_stop": 61362.39,
+            "breakeven_ratchet_trigger_price": 60243.33,
+            "trailing_or_target_rule": "bb_sma20_mid_or_18h",
+            "max_hold_hours": 18,
+        },
+        "position_sizing": {"qty_contracts": 0.0011, "notional_usdt": 67.58, "leverage": 2.0, "initial_margin_usdt": 33.79, "free_cash_after_entry_usdt": 66.17},
+        "cost_and_risk": {"risk_budget_usdt": 1.0, "estimated_normal_stop_loss_usdt": 0.99, "estimated_normal_stop_loss_pct_equity": 0.99, "estimated_isolated_liquidation": 91732.13},
+    }
+    md_trade = answer_judgment_query("今天黄金、BTC、纳指 100 看多还是看空？", packet=pkt_trade)["markdown"]
+    assert "62231.23" in md_trade and "初始止损" in md_trade
+    assert "60735.38" in md_trade and "止盈与保本" in md_trade
+    assert "18 小时" in md_trade and "最长持仓" in md_trade
+    assert "67.58" in md_trade and "USDT" in md_trade
 
     why = answer_judgment_query("为什么不做多？", packet=pkt)
     assert "距离 v2.2.1 正式触发条件" in why["markdown"]
