@@ -1756,6 +1756,7 @@ _PIT_VERIFIED_ARCHIVE_DOMAINS = (
     "onchain",
     "exchange_netflow",
     "gold_cot",
+    "gold_etf_flows",
     "polymarket",
 )
 

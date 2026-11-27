@@ -85,6 +85,7 @@ macro_and_tide_thresholds:
   intraday_tnx_24h_bps: 6.0
   qqew_qqq_5d_spread_pct: 0.75
   btc_exchange_netflow_btc_min: 1500.0
+  gold_etf_3d_musd_min: 150.0
 
 venue_microstructure:
   mark_last_warn_bps: 25.0

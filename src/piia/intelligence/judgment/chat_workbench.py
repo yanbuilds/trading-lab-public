@@ -459,11 +459,20 @@ def _render_overview(packet: dict[str, Any]) -> dict[str, Any]:
     ledger = packet.get("factor_usage_ledger") or {}
     used_cnt = sum(1 for entries in ledger.values() for e in entries if e.get("participated_in_judgment"))
     chg_cnt = sum(1 for entries in ledger.values() for e in entries if e.get("participation_status") == "changed_judgment")
-    missing_labels = _dedup_list([_humanize_gap(m) for m in ((packet.get("audit_coverage") or {}).get("factors_missing") or [])], 6)
+    raw_missing = list((packet.get("audit_coverage") or {}).get("factors_missing") or [])
+    proxied_labels: list[str] = []
+    if "macro:ice_dxy" in raw_missing:
+        proxied_labels.append("ICE DXY(用DX-Y.NYB代理)")
+    if "macro:real_yield_intraday" in raw_missing:
+        proxied_labels.append("盘中TIPS(用^TNX/TIP代理)")
+    true_missing_ids = [m for m in raw_missing if m not in {"macro:ice_dxy", "macro:real_yield_intraday"}]
+    true_missing_labels = _dedup_list([_short_factor_label(m) for m in true_missing_ids], 6)
+    proxied_s = "、".join(proxied_labels) if proxied_labels else "无"
+    missing_s = "、".join(true_missing_labels) if true_missing_labels else "无"
     lines.extend(
         [
             "",
-            f"- **因子审计与缺口**：7 域共介入 `{used_cnt}` 项（改判驱动 `{chg_cnt}` 项），外部 AI=`{(ai_prov.get('llm_research_opinion') or {}).get('status')}` / 独立反方=`{(ai_prov.get('independent_ai_critic') or {}).get('status')}`｜缺失：{('、'.join(missing_labels)) if missing_labels else '无'}（完整逐项留痕见 JSON `factor_usage_ledger`）。",
+            f"- **因子审计与缺口**：7 域共介入 `{used_cnt}` 项（改判驱动 `{chg_cnt}` 项），外部 AI=`{(ai_prov.get('llm_research_opinion') or {}).get('status')}` / 独立反方=`{(ai_prov.get('independent_ai_critic') or {}).get('status')}`｜已用代理替代(无付费直连)：{proxied_s}｜真缺失：{missing_s}（完整留痕见 JSON `factor_usage_ledger`）。",
             f"- **时点链路**：K线截止 `{_fmt_utc_short(lc.get('bar_cutoff_utc', packet['cutoff_utc']))}` → 最新公告 `{_fmt_utc_short(lc.get('latest_announcement_published_at_utc'))}` → 判断生成 `{_fmt_utc_short(lc.get('judgment_generated_at_utc'), include_sec=True)}` → 最早可成交 `{_fmt_utc_short(earliest_exec)}`。",
         ]
     )

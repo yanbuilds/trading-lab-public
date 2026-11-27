@@ -16,9 +16,12 @@ import io
 import json
 import math
 from pathlib import Path
+import re
 import tempfile
 from typing import Any
 from urllib.parse import urlencode
+import xml.etree.ElementTree as ET
+import zipfile
 
 import httpx
 import pandas as pd
@@ -40,6 +43,11 @@ STOOQ_DX_URL = "https://stooq.com/q/l/?s=dx.f&f=sd2t2ohlcv&h&e=csv"
 YAHOO_CHART_BASE = "https://query1.finance.yahoo.com/v8/finance/chart"
 COINMETRICS_EXFLOW_URL = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"
 BITGET_MIX_BASE = "https://api.bitget.com/api/v2/mix/market"
+SSGA_GLD_XLSX_URL = "https://www.ssga.com/us/en/intermediary/etfs/library-content/products/fund-data/etfs/us/navhist-us-en-gld.xlsx"
+US_TREASURY_REAL_YIELD_CSV_TMPL = (
+    "https://home.treasury.gov/resource-center/data-chart-center/interest-rates/"
+    "daily-treasury-rates.csv/{year}/all?type=daily_treasury_real_yield_curve&field_tdr_date_value={year}&page&_format=csv"
+)
 
 DATA_TIERS = (
     "realtime_verified",
@@ -439,7 +447,8 @@ def _series_stats(
                 continue
         except (KeyError, TypeError, ValueError):
             continue
-        avail = d + timedelta(days=lag_days)
+        explicit_avail = _ts_utc(row.get("available_at_utc"))
+        avail = max(explicit_avail, d) if explicit_avail is not None else (d + timedelta(days=lag_days))
         if d <= cutoff_utc and avail <= cutoff_utc:
             usable.append((d, val, avail))
     usable.sort(key=lambda x: x[0])
@@ -732,6 +741,224 @@ def fetch_bitget_venue_microstructure(
         "symbols": out_syms,
         "errors": errors,
     }
+
+
+def _col_letters_to_idx(ref: str) -> int | None:
+    m = re.match(r"([A-Za-z]+)", ref or "")
+    if not m:
+        return None
+    idx = 0
+    for ch in m.group(1).upper():
+        idx = idx * 26 + (ord(ch) - ord("A") + 1)
+    return idx - 1
+
+
+def _parse_gld_date(raw_val: Any) -> datetime | None:
+    txt = str(raw_val or "").strip()
+    if not txt:
+        return None
+    for fmt in ("%d-%b-%Y", "%Y-%m-%d", "%m/%d/%Y", "%d-%B-%Y"):
+        try:
+            return datetime.strptime(txt, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        serial = float(txt)
+        if 20000 < serial < 90000:
+            return datetime(1899, 12, 30, tzinfo=timezone.utc) + timedelta(days=int(round(serial)))
+    except ValueError:
+        pass
+    return None
+
+
+def fetch_spdr_gld_etf_flows(
+    *,
+    decision_cutoff_utc: datetime,
+    timeout: float = 12.0,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Fetch State Street SPDR Gold Shares (GLD) official daily NAV & Shares XLSX strictly <= cutoff."""
+    cutoff_utc = decision_cutoff_utc.astimezone(timezone.utc)
+    own = client is None
+    client = client or httpx.Client(timeout=timeout, follow_redirects=True, headers={"User-Agent": "TradingLabResearch/3.2"})
+    try:
+        resp = client.get(SSGA_GLD_XLSX_URL)
+        resp.raise_for_status()
+        raw = resp.content
+        raw_sha = hashlib.sha256(raw).hexdigest()
+        ns = {"s": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in zf.namelist():
+                ss_root = ET.fromstring(zf.read("xl/sharedStrings.xml"))
+                for si in ss_root.findall("s:si", ns):
+                    shared.append("".join(t.text or "" for t in si.findall(".//s:t", ns)))
+            sheet_name = next((n for n in sorted(zf.namelist()) if n.startswith("xl/worksheets/sheet") and n.endswith(".xml")), None)
+            if not sheet_name:
+                return {"usable": False, "reason": "missing_worksheet_in_xlsx", "source_url": SSGA_GLD_XLSX_URL}
+            s_root = ET.fromstring(zf.read(sheet_name))
+
+        table_rows: list[list[str]] = []
+        for row_el in s_root.findall(".//s:row", ns):
+            row_vals: dict[int, str] = {}
+            next_col = 0
+            for c_el in row_el.findall("s:c", ns):
+                c_idx = _col_letters_to_idx(c_el.attrib.get("r", ""))
+                if c_idx is None:
+                    c_idx = next_col
+                next_col = c_idx + 1
+                ctype = c_el.attrib.get("t", "")
+                if ctype == "inlineStr":
+                    val_str = "".join(t.text or "" for t in c_el.findall(".//s:t", ns))
+                else:
+                    v_el = c_el.find("s:v", ns)
+                    if v_el is None or v_el.text is None:
+                        continue
+                    if ctype == "s":
+                        val_str = shared[int(v_el.text)]
+                    else:
+                        val_str = v_el.text
+                row_vals[c_idx] = val_str
+            if row_vals:
+                max_c = max(row_vals) + 1
+                table_rows.append([row_vals.get(i, "") for i in range(max_c)])
+
+        col_idx: dict[str, int] = {}
+        data_start = 0
+        for idx, r in enumerate(table_rows[:25]):
+            lowered = [c.strip().lower() for c in r]
+            if "date" in lowered and "nav" in lowered and any("shares" in c for c in lowered):
+                col_idx["date"] = lowered.index("date")
+                col_idx["nav"] = lowered.index("nav")
+                col_idx["shares"] = next(i for i, c in enumerate(lowered) if "shares" in c)
+                if any("net assets" in c for c in lowered):
+                    col_idx["assets"] = next(i for i, c in enumerate(lowered) if "net assets" in c)
+                data_start = idx + 1
+                break
+        if "date" not in col_idx:
+            return {"usable": False, "reason": "header_row_not_found", "source_url": SSGA_GLD_XLSX_URL}
+
+        eligible: list[tuple[datetime, datetime, float, float, float | None]] = []
+        for r in table_rows[data_start:]:
+            max_need = max(col_idx.values())
+            if len(r) <= max_need:
+                continue
+            d_dt = _parse_gld_date(r[col_idx["date"]])
+            if d_dt is None:
+                continue
+            avail_dt = d_dt.replace(hour=22, minute=0, second=0, microsecond=0)
+            if avail_dt > cutoff_utc:
+                continue
+            try:
+                nav = float(str(r[col_idx["nav"]]).replace(",", ""))
+                shares = float(str(r[col_idx["shares"]]).replace(",", ""))
+                assets = float(str(r[col_idx["assets"]]).replace(",", "")) if "assets" in col_idx and r[col_idx["assets"]] else None
+            except ValueError:
+                continue
+            if math.isfinite(nav) and math.isfinite(shares) and nav > 0 and shares > 0:
+                eligible.append((d_dt, avail_dt, nav, shares, assets))
+
+        if not eligible:
+            return {"usable": False, "reason": "no_point_in_time_eligible_row", "source_url": SSGA_GLD_XLSX_URL, "raw_sha256": raw_sha}
+        eligible.sort(key=lambda x: x[0])
+        last_d, last_avail, last_nav, last_shares, last_assets = eligible[-1]
+        prev1_shares = eligible[-2][3] if len(eligible) >= 2 else last_shares
+        prev3_shares = eligible[max(0, len(eligible) - 4)][3]
+        d1_shares = last_shares - prev1_shares
+        d3_shares = last_shares - prev3_shares
+        flow_1d_musd = round((d1_shares * last_nav) / 1e6, 2)
+        flow_3d_musd = round((d3_shares * last_nav) / 1e6, 2)
+        return {
+            "usable": True,
+            "source_name": "State Street SPDR Gold Shares (GLD) Official NAV History",
+            "source_url": SSGA_GLD_XLSX_URL,
+            "raw_sha256": raw_sha,
+            "asof_date": last_d.date().isoformat(),
+            "observed_at_utc": last_avail.isoformat(),
+            "available_at_utc": last_avail.isoformat(),
+            "nav": round(last_nav, 4),
+            "shares_outstanding": int(round(last_shares)),
+            "total_net_assets_usd": round(last_assets, 2) if last_assets is not None else None,
+            "delta_1d_shares": int(round(d1_shares)),
+            "delta_3d_shares": int(round(d3_shares)),
+            "net_flow_1d_musd": flow_1d_musd,
+            "net_flow_3d_musd": flow_3d_musd,
+            "net_tonnage_or_flow": flow_3d_musd,
+            "coverage_scope": "spdr_gld_single_flagship_etf",
+        }
+    except Exception as exc:
+        return {"usable": False, "reason": type(exc).__name__, "source_url": SSGA_GLD_XLSX_URL}
+    finally:
+        if own:
+            client.close()
+
+
+def fetch_us_treasury_daily_real_yield(
+    *,
+    decision_cutoff_utc: datetime,
+    timeout: float = 10.0,
+    client: httpx.Client | None = None,
+) -> dict[str, Any]:
+    """Fetch US Treasury official daily real yield curve CSV (10 YR) strictly <= cutoff."""
+    cutoff_utc = decision_cutoff_utc.astimezone(timezone.utc)
+    years = [cutoff_utc.year - 1, cutoff_utc.year] if (cutoff_utc.month == 1 and cutoff_utc.day <= 10) else [cutoff_utc.year]
+    own = client is None
+    client = client or httpx.Client(timeout=timeout, follow_redirects=True, headers={"User-Agent": "TradingLabResearch/3.2"})
+    obs_by_date: dict[str, dict[str, Any]] = {}
+    last_url = US_TREASURY_REAL_YIELD_CSV_TMPL.format(year=cutoff_utc.year)
+    last_sha: str | None = None
+    try:
+        for yr in years:
+            url = US_TREASURY_REAL_YIELD_CSV_TMPL.format(year=yr)
+            last_url = url
+            resp = client.get(url)
+            resp.raise_for_status()
+            last_sha = hashlib.sha256(resp.content).hexdigest()
+            reader = csv.DictReader(io.StringIO(resp.text))
+            for row in reader:
+                if not isinstance(row, dict):
+                    continue
+                d_raw = str(row.get("Date") or "").strip()
+                v_raw = str(row.get("10 YR") or "").strip()
+                if not d_raw or not v_raw:
+                    continue
+                d_dt: datetime | None = None
+                for fmt in ("%m/%d/%Y", "%Y-%m-%d"):
+                    try:
+                        d_dt = datetime.strptime(d_raw, fmt).replace(tzinfo=timezone.utc)
+                        break
+                    except ValueError:
+                        continue
+                if d_dt is None:
+                    continue
+                avail_dt = d_dt.replace(hour=22, minute=0, second=0, microsecond=0)
+                if d_dt <= cutoff_utc and avail_dt <= cutoff_utc:
+                    try:
+                        val = float(v_raw)
+                    except ValueError:
+                        continue
+                    if math.isfinite(val):
+                        iso_d = d_dt.date().isoformat()
+                        obs_by_date[iso_d] = {
+                            "observation_date": iso_d,
+                            "value": val,
+                            "available_at_utc": avail_dt.isoformat(),
+                        }
+        sorted_obs = [obs_by_date[k] for k in sorted(obs_by_date)]
+        if not sorted_obs:
+            return {"ok": False, "reason": "no_point_in_time_eligible_row", "source_url": last_url}
+        return {
+            "ok": True,
+            "source_url": last_url,
+            "raw_sha256": last_sha,
+            "asof_date": sorted_obs[-1]["observation_date"],
+            "observations": sorted_obs,
+        }
+    except Exception as exc:
+        return {"ok": False, "reason": type(exc).__name__, "source_url": last_url}
+    finally:
+        if own:
+            client.close()
 
 
 _CALENDAR_STOPWORDS = frozenset({
@@ -1933,32 +2160,63 @@ def build_sentiment_flow_evidence(
     )
 
     getf = gold_etf_ctx or {}
-    getf_avail = bool(getf.get("usable") and getf.get("net_tonnage_or_flow") is not None)
+    getf_pit_ok = (not replay_mode) or bool(getf.get("historical_point_in_time_verified")) or bool(getf.get("available_at_utc"))
+    getf_obs_dt = _ts_utc(getf.get("available_at_utc") or getf.get("observed_at_utc"))
+    getf_max_days = int(fcfg.get("etf_complete_max_age_days", 7))
+    getf_flow_3d = getf.get("net_flow_3d_musd") if getf.get("net_flow_3d_musd") is not None else getf.get("net_tonnage_or_flow")
+    getf_flow_1d = getf.get("net_flow_1d_musd")
+    if getf_pit_ok and getf.get("usable") and getf_flow_3d is not None and getf_obs_dt is not None:
+        if getf_obs_dt > cutoff_utc:
+            getf_fresh = "future_excluded"
+            getf_avail = False
+        elif (cutoff_utc - getf_obs_dt).total_seconds() > getf_max_days * 86400.0:
+            getf_fresh = "stale_excluded"
+            getf_avail = False
+        else:
+            getf_fresh = "lagged_usable"
+            getf_avail = True
+    else:
+        getf_fresh = "missing"
+        getf_avail = False
+
     getf_dir = {s: "unknown" for s in SYMBOLS}
     if getf_avail:
-        fv = float(getf["net_tonnage_or_flow"])
-        getf_dir["XAUUSDT"] = "bullish" if fv > 0 else ("bearish" if fv < 0 else "neutral")
+        fv = float(getf_flow_3d)
+        getf_thr = float(mcfg.get("gold_etf_3d_musd_min", 150.0))
+        getf_dir["XAUUSDT"] = "bullish" if fv >= getf_thr else ("bearish" if fv <= -getf_thr else "neutral")
     atoms.append(
         make_atom(
             evidence_id="sentiment:xau:gold_etf_flows",
             domain="sentiment_flow",
-            factor_name="可核验黄金 ETF 持仓/资金流向",
+            factor_name="可核验黄金 ETF 持仓/资金流向 (SPDR GLD)",
             source_name=str(getf.get("source_name") or "unavailable_in_free_public_feeds"),
             source_url=getf.get("source_url"),
             raw_sha256=getf.get("raw_sha256"),
             data_tier="lagged_official_report" if getf_avail else "unavailable",
-            observed_at_utc=getf.get("observed_at_utc"),
-            published_at_utc=getf.get("observed_at_utc"),
-            available_at_utc=getf.get("observed_at_utc"),
+            observed_at_utc=getf_obs_dt.isoformat() if getf_avail and getf_obs_dt else None,
+            published_at_utc=getf_obs_dt.isoformat() if getf_avail and getf_obs_dt else None,
+            available_at_utc=getf_obs_dt.isoformat() if getf_avail and getf_obs_dt else None,
             available_at_known=getf_avail,
             retrieved_at_utc=cutoff_iso,
-            freshness_status="lagged_usable" if getf_avail else "missing",
+            freshness_status=getf_fresh,
             applies_to_symbols=["XAUUSDT"],
             applies_to_horizons=["swing_1_3d"],
-            value_summary={"net_flow": getf.get("net_tonnage_or_flow"), "status": "available" if getf_avail else "unavailable"},
+            value_summary={
+                "net_flow_3d_musd": getf_flow_3d if getf_avail else None,
+                "net_flow_1d_musd": getf_flow_1d if getf_avail else None,
+                "asof_date": getf.get("asof_date") if getf_avail else None,
+                "shares_outstanding": getf.get("shares_outstanding") if getf_avail else None,
+                "coverage_scope": getf.get("coverage_scope") or "spdr_gld_single_flagship_etf",
+                "api_responded_ok": bool(getf.get("usable")),
+                "status": "available" if getf_avail else (getf.get("reason") or "unavailable"),
+            },
             direction_by_symbol=getf_dir,
             causal_driver_group="gold_etf_flow",
-            limitation_note="公开免费源未提供逐日带时间戳的实物黄金 ETF（GLD/IAU）份额申赎吨位表，保持未知",
+            limitation_note=(
+                "采用道富 SPDR GLD 官方逐日净值/份额变动测算（代表龙头单只黄金 ETF 日度申赎，非全市场黄金 ETF 合计口径，盘后发布）"
+                if getf_avail
+                else "当前未获取到经时点核验的官方黄金 ETF 份额变动表，保持未知"
+            ),
         )
     )
 
@@ -2096,6 +2354,8 @@ def build_sentiment_flow_evidence(
         "btc_etf_latest_musd": etf_latest_single,
         "btc_etf_compiler_mode": etf_mode,
         "btc_etf_partial_unreported": partial_unreported,
+        "gold_etf_3d_musd": float(getf_flow_3d) if getf_avail else None,
+        "gold_etf_1d_musd": float(getf_flow_1d) if (getf_avail and getf_flow_1d is not None) else None,
         "vix": vix_summary,
         "ndx_minus_spx_5obs_pct": rel_spread,
         "gold_cot_noncomm_net": net_nc if cot_ok else None,
@@ -2404,6 +2664,36 @@ def collect_judgment_inputs(
         collection_errors["venue_micro"] = type(exc).__name__
 
     try:
+        treasury_ry = fetch_us_treasury_daily_real_yield(decision_cutoff_utc=decision_cutoff_utc)
+        if treasury_ry.get("ok") and treasury_ry.get("observations"):
+            dfii_entry = dict(alfred_series.get("DFII10") or {"series_id": "DFII10", "observations": []})
+            merged_obs: dict[str, dict[str, Any]] = {
+                str(o["observation_date"])[:10]: dict(o)
+                for o in (dfii_entry.get("observations") or [])
+                if isinstance(o, dict) and o.get("observation_date")
+            }
+            for t_row in treasury_ry["observations"]:
+                d_key = str(t_row["observation_date"])[:10]
+                if d_key not in merged_obs:
+                    merged_obs[d_key] = dict(t_row)
+            dfii_entry["observations"] = [merged_obs[k] for k in sorted(merged_obs)]
+            dfii_entry["treasury_supplement_asof"] = treasury_ry.get("asof_date")
+            dfii_entry["treasury_source_url"] = treasury_ry.get("source_url")
+            alfred_series["DFII10"] = dfii_entry
+        elif not treasury_ry.get("ok") and treasury_ry.get("reason"):
+            collection_errors["treasury_real_yield"] = str(treasury_ry["reason"])
+    except Exception as exc:
+        collection_errors["treasury_real_yield"] = type(exc).__name__
+
+    try:
+        gold_etf_ctx = fetch_spdr_gld_etf_flows(decision_cutoff_utc=decision_cutoff_utc)
+        if not gold_etf_ctx.get("usable") and gold_etf_ctx.get("reason"):
+            collection_errors["spdr_gld"] = str(gold_etf_ctx["reason"])
+    except Exception as exc:
+        gold_etf_ctx = {"usable": False, "reason": type(exc).__name__}
+        collection_errors["spdr_gld"] = type(exc).__name__
+
+    try:
         polymarket_ctx = fetch_prediction_markets(now=decision_cutoff_utc)
     except Exception as exc:
         polymarket_ctx = {"usable_for_research": False, "events": [], "error": type(exc).__name__}
@@ -2453,7 +2743,7 @@ def collect_judgment_inputs(
         "onchain": onchain_ctx,
         "exchange_netflow": exchange_netflow_ctx,
         "venue_microstructure": venue_micro,
-        "gold_etf_flows": None,
+        "gold_etf_flows": gold_etf_ctx,
         "polymarket": polymarket_ctx,
         "raw_news_items": [*rss_items, *edgar_items],
         "ndx_edgar_filings": edgar_items,
