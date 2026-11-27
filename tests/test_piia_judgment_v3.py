@@ -302,7 +302,8 @@ def test_chat_workbench_qa_whatif_diff_and_isolated_shadow_ledger(tmp_path, monk
     q1 = answer_judgment_query("今天黄金、BTC、纳指 100 看多还是看空？", packet=cur_pkt, previous_packet=prev_pkt)
     assert q1["intent"] == "overview"
     assert len(q1["summary_table"]) == 3
-    assert "v2.2.1 正式信号" in q1["markdown"]
+    assert "`v2.2.1` 信号" in q1["markdown"] or "v2.2.1 信号" in q1["markdown"]
+    assert "dir=" not in q1["markdown"] and "role=" not in q1["markdown"]
 
     # Q2: Why not short?
     q2 = answer_judgment_query("BTC为什么不做空？", packet=cur_pkt, previous_packet=prev_pkt)
@@ -974,13 +975,24 @@ def test_markdown_dedup_setup_bridge_and_chronos_run_window():
 
     ans = answer_judgment_query("今天黄金、BTC、纳指 100 看多还是看空？", packet=pkt)
     md = ans["markdown"]
-    assert "研究→开仓等待条件 (v2.2.1)" in md
+    assert "一句话结论速览" in md
+    assert "研究→开仓等待条件 (`v2.2.1`)" in md
     assert "交易所微观结构盘口/资金费率" in md
+    assert "模型预测对照（非校准交易概率）" in md
+    assert "七大因子域审计摘要" in md
+    assert "dir=" not in md and "role=" not in md
+
+    # Verify nested evidence bullets have zero duplicates per section & symbol
+    cur_sec_items: list[str] | None = None
     for line in md.splitlines():
-        if line.startswith("- **关键依据**：") or line.startswith("- **最强反证**：") or line.startswith("- **失效与改判条件**："):
-            body = line.split("：", 1)[1]
-            parts = [p.strip() for p in body.split("; ") if p.strip()]
-            assert len(parts) == len(set(parts)), f"Duplicate entries in Markdown line: {line}"
+        if line.startswith("- **关键依据**：") or line.startswith("- **最强反证") or line.startswith("- **失效与改判条件**："):
+            cur_sec_items = []
+        elif line.startswith("  - ") and cur_sec_items is not None:
+            cur_sec_items.append(line[4:].strip())
+        else:
+            if cur_sec_items is not None:
+                assert len(cur_sec_items) == len(set(cur_sec_items)), f"Duplicate nested bullets: {cur_sec_items}"
+            cur_sec_items = None
 
     why = answer_judgment_query("为什么不做多？", packet=pkt)
     assert "距离 v2.2.1 正式触发条件" in why["markdown"]

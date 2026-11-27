@@ -15,7 +15,7 @@ PINNED_SHA256 = {
     "src/piia/intelligence/judgment/evidence.py": "7b438676b023e57299d1a8ccae97fb4381c37b5577e0cdcd8e7efdc7eb2f4ef2",
     "src/piia/intelligence/judgment/tide.py": "88fda335b845915eebad16db4f4841c6fcdf8b0aae004f60c149776755a059fb",
     "src/piia/intelligence/judgment/synthesizer.py": "57e2251e53ff4a0ace52447e9b37a3740b5616cf0e16279581813598d2b41fa9",
-    "src/piia/intelligence/judgment/chat_workbench.py": "733fee0fc9268c69afdb45ca0a218fb2d0307ee4ce745c5bafe4c552610b250c",
+    "src/piia/intelligence/judgment/chat_workbench.py": "4ce89a1a82d7b66834c38ccb5d6b13b846e13ce08c5ffb7a30a929238dcc1b6b",
     "src/piia/intelligence/judgment/evaluation.py": "0763db831f92a652307dd4909e46b521e5297ab6a52b79f403f05608bffbaefd",
     "experiments/replay_nvidia_20261123_case.py": "1fe93603fbe88742eb96a95f553ef550917a78d3d99972b4cff2d2f0d36a0a85",
 }
