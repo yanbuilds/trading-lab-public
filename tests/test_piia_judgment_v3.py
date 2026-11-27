@@ -29,6 +29,8 @@ from piia.intelligence.judgment.evidence import (
     build_sentiment_flow_evidence,
     fetch_bitget_venue_microstructure,
     fetch_coinmetrics_btc_exchange_flows,
+    fetch_spdr_gld_etf_flows,
+    fetch_us_treasury_daily_real_yield,
     fetch_yahoo_intraday_macro_and_breadth,
     generate_demo_judgment_inputs,
     load_judgment_config,
@@ -1246,4 +1248,205 @@ def test_archived_5_domain_bundles_append_only_replay_cli_and_api(tmp_path, monk
         r = client.get("/judgment-v3/replay-archived", params={"demo": "true", "starting_cash": 100})
         assert r.status_code == 200
         assert r.json()["archived_bundles_count"] == 1
+
+
+def _build_minimal_gld_xlsx(rows: list[list[str]]) -> bytes:
+    """Create a valid minimal OOXML XLSX matching State Street GLD NAV History layout."""
+    import io
+    import zipfile
+    from xml.sax.saxutils import escape
+
+    content_types = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
+        '<Default Extension="xml" ContentType="application/xml"/>'
+        '<Override PartName="/xl/workbook.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
+        '<Override PartName="/xl/sharedStrings.xml" '
+        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sharedStrings+xml"/>'
+        "</Types>"
+    )
+    rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
+        'Target="xl/workbook.xml"/>'
+        "</Relationships>"
+    )
+    wb = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheets><sheet name="NAV History" sheetId="1" r:id="rId1"/></sheets>'
+        "</workbook>"
+    )
+    wb_rels = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
+        '<Relationship Id="rId1" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/>'
+        '<Relationship Id="rId2" '
+        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/sharedStrings" '
+        'Target="sharedStrings.xml"/>'
+        "</Relationships>"
+    )
+    shared: list[str] = []
+    shared_idx: dict[str, int] = {}
+
+    def _s_idx(val: str) -> int:
+        if val not in shared_idx:
+            shared_idx[val] = len(shared)
+            shared.append(val)
+        return shared_idx[val]
+
+    sheet_rows_xml = []
+    for r_i, row in enumerate(rows, start=1):
+        cells_xml = []
+        for c_i, cell_val in enumerate(row):
+            col_letter = chr(ord("A") + c_i)
+            idx = _s_idx(str(cell_val))
+            cells_xml.append(f'<c r="{col_letter}{r_i}" t="s"><v>{idx}</v></c>')
+        sheet_rows_xml.append(f'<row r="{r_i}">{"".join(cells_xml)}</row>')
+
+    ss_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        f'<sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" count="{len(shared)}" uniqueCount="{len(shared)}">'
+        + "".join(f"<si><t>{escape(s)}</t></si>" for s in shared)
+        + "</sst>"
+    )
+    sheet_xml = (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        f"<sheetData>{''.join(sheet_rows_xml)}</sheetData>"
+        "</worksheet>"
+    )
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("[Content_Types].xml", content_types)
+        zf.writestr("_rels/.rels", rels)
+        zf.writestr("xl/workbook.xml", wb)
+        zf.writestr("xl/_rels/workbook.xml.rels", wb_rels)
+        zf.writestr("xl/sharedStrings.xml", ss_xml)
+        zf.writestr("xl/worksheets/sheet1.xml", sheet_xml)
+    return buf.getvalue()
+
+
+def test_spdr_gld_xlsx_fetcher_and_gold_etf_sentiment_direction():
+    import httpx
+
+    cfg = load_judgment_config()
+    cutoff = datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc)
+    xlsx_bytes = _build_minimal_gld_xlsx(
+        [
+            ["Fund Name", "SPDR Gold Shares", "", ""],
+            ["Date", "NAV", "Shares Outstanding", "Total Net Assets"],
+            ["26-Nov-2026", "320.0", "362000000", "115840000000"],  # 22:00 UTC > cutoff -> excluded!
+            ["25-Nov-2026", "317.5", "360600000", "114490500000"],
+            ["24-Nov-2026", "315.0", "360200000", "113463000000"],
+            ["21-Nov-2026", "314.0", "360000000", "113040000000"],
+            ["20-Nov-2026", "312.0", "359800000", "112257600000"],
+        ]
+    )
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, content=xlsx_bytes))
+    with httpx.Client(transport=transport) as client:
+        gld = fetch_spdr_gld_etf_flows(decision_cutoff_utc=cutoff, client=client)
+
+    assert gld["usable"] is True
+    assert gld["asof_date"] == "2026-11-25"
+    assert gld["coverage_scope"] == "spdr_gld_single_flagship_etf"
+    assert gld["delta_1d_shares"] == 400000
+    assert gld["delta_3d_shares"] == 800000
+    assert gld["net_flow_1d_musd"] == 127.0
+    assert gld["net_flow_3d_musd"] == 254.0
+
+    inputs = generate_demo_judgment_inputs(now=cutoff)
+    common_kw = dict(
+        market_snapshot=inputs["market_snapshot"],
+        alfred_series=inputs["alfred_series"],
+        fear_greed_ctx=inputs["fear_greed"],
+        etf_ctx=inputs["etf_flows"],
+        gold_cot_ctx=inputs["gold_cot"],
+        onchain_ctx=inputs["onchain"],
+        exchange_netflow_ctx=inputs["exchange_netflow"],
+        ndx_edgar_filings=inputs["ndx_edgar_filings"],
+        polymarket_ctx=inputs["polymarket"],
+        cutoff_utc=cutoff,
+        cfg=cfg,
+    )
+    atoms, _, sent_summary = build_sentiment_flow_evidence(gold_etf_ctx=gld, **common_kw)
+    gld_atom = next(a for a in atoms if a["evidence_id"] == "sentiment:xau:gold_etf_flows")
+    assert gld_atom["freshness_status"] == "lagged_usable"
+    assert gld_atom["direction_by_symbol"]["XAUUSDT"] == "bullish"
+    assert sent_summary["gold_etf_3d_musd"] == 254.0
+
+    # Test bearish and neutral directions around gold_etf_3d_musd_min (150M)
+    atoms_bear, _, _ = build_sentiment_flow_evidence(
+        gold_etf_ctx=dict(gld, net_flow_3d_musd=-220.0, net_tonnage_or_flow=-220.0),
+        **common_kw,
+    )
+    assert next(a for a in atoms_bear if a["evidence_id"] == "sentiment:xau:gold_etf_flows")["direction_by_symbol"]["XAUUSDT"] == "bearish"
+
+    atoms_flat, _, _ = build_sentiment_flow_evidence(
+        gold_etf_ctx=dict(gld, net_flow_3d_musd=40.0, net_tonnage_or_flow=40.0),
+        **common_kw,
+    )
+    assert next(a for a in atoms_flat if a["evidence_id"] == "sentiment:xau:gold_etf_flows")["direction_by_symbol"]["XAUUSDT"] == "neutral"
+
+
+def test_us_treasury_real_yield_csv_pit_bounds_and_audit_gap_split():
+    import httpx
+    from piia.intelligence.judgment.chat_workbench import answer_judgment_query
+    from piia.intelligence.judgment.synthesizer import synthesize_judgment_packet
+
+    cfg = load_judgment_config()
+    cutoff = datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc)
+    csv_body = (
+        'Date,"5 YR","7 YR","10 YR","20 YR","30 YR"\n'
+        '11/26/2026,2.10,2.40,2.80,2.90,2.95\n'  # 22:00 UTC > cutoff -> excluded!
+        '11/25/2026,2.05,2.35,2.73,2.88,2.92\n'
+        '11/24/2026,2.06,2.36,2.75,2.89,2.93\n'
+    )
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, text=csv_body))
+    with httpx.Client(transport=transport) as client:
+        ry = fetch_us_treasury_daily_real_yield(decision_cutoff_utc=cutoff, client=client)
+
+    assert ry["ok"] is True
+    assert ry["asof_date"] == "2026-11-25"
+    assert [o["observation_date"] for o in ry["observations"]] == ["2026-11-24", "2026-11-25"]
+
+    inputs = generate_demo_judgment_inputs(now=cutoff)
+    # Inject Treasury observations with explicit available_at_utc on top of older DFII10 points
+    base_obs = list((inputs["alfred_series"]["DFII10"].get("observations") or [])[:-2])
+    inputs["alfred_series"]["DFII10"]["observations"] = base_obs + ry["observations"]
+    macro_atoms, macro_summary = build_macro_evidence(
+        alfred_series=inputs["alfred_series"],
+        dxy_live=inputs["dxy_live"],
+        event_calendar=inputs["event_calendar"],
+        verified_news=[],
+        vix_summary={},
+        cutoff_utc=cutoff,
+        cfg=cfg,
+    )
+
+    dfii_atom = next(a for a in macro_atoms if a["evidence_id"] == "macro:real_yield_daily:DFII10")
+    ry_intraday_atom = next(a for a in macro_atoms if a["evidence_id"] == "macro:real_yield_intraday")
+    assert dfii_atom["freshness_status"] == "lagged_usable"
+    assert dfii_atom["value_summary"]["observation_date"] == "2026-11-25"
+    assert dfii_atom["value_summary"]["value_pct"] == 2.73
+    assert macro_summary["real_yield_dfii10_pct"] == 2.73
+    # Daily Treasury DFII10 must never falsely claim to be intraday TIPS realtime
+    assert ry_intraday_atom["freshness_status"] == "missing"
+
+    packet = synthesize_judgment_packet(inputs, starting_cash_usdt=100.0)
+    ans = answer_judgment_query("今天黄金、BTC、纳指 100 看多还是看空？", packet=packet)
+    md = ans["markdown"]
+    assert "已用代理替代(无付费直连)" in md
+    assert "ICE DXY(用DX-Y.NYB代理)" in md
+    assert "盘中TIPS(用^TNX/TIP代理)" in md
+    assert "真缺失：" in md
 
